@@ -1,0 +1,8 @@
+{
+  "name": "MovieJournal",
+  "description": "A premium, Apple TV-inspired movie and TV catalogue powered by TMDB.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

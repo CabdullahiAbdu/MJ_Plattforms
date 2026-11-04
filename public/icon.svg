@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="35%" r="65%">
+      <stop offset="0%" stop-color="#27272a" />
+      <stop offset="100%" stop-color="#000000" />
+    </radialGradient>
+    <linearGradient id="strokeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="100%" stop-color="#d4d4d8" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#glow)" />
+  <rect x="16" y="16" width="480" height="480" rx="98" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="4" />
+  <!-- Cinema Reels -->
+  <circle cx="182" cy="154" r="38" fill="none" stroke="url(#strokeGrad)" stroke-width="18" />
+  <circle cx="182" cy="154" r="10" fill="#ffffff" />
+  <circle cx="310" cy="154" r="38" fill="none" stroke="url(#strokeGrad)" stroke-width="18" />
+  <circle cx="310" cy="154" r="10" fill="#ffffff" />
+  <!-- Monogram 'M' Cinema Projector Frame -->
+  <path
+    d="M128 368 V224 C128 210 144 204 156 216 L246 310 L336 216 C348 204 364 210 364 224 V368"
+    fill="none"
+    stroke="url(#strokeGrad)"
+    stroke-width="34"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <!-- Projector Lens Flare -->
+  <polygon points="384,268 424,244 424,332 384,308" fill="#ffffff" fill-opacity="0.9" />
+</svg>

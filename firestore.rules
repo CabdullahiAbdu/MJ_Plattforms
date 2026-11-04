@@ -1,0 +1,430 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Global Safety Net (Default-Deny Catch-All)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Hardened Global Primitives ---
+    function isSignedIn() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isNonAnonymousUser() {
+      return isSignedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    function isOwner(userId) {
+      return isNonAnonymousUser() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function parentUserExists(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId)) &&
+        get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+    }
+
+    // --- Validation Blueprints ---
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll([
+          'uid',
+          'displayName',
+          'photoURL',
+          'region',
+          'language',
+          'theme',
+          'userProviders',
+          'userGenres',
+          'autoplay',
+          'dataSaver',
+          'includeAdult',
+          'lastLibraryUpdatedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid',
+          'displayName',
+          'photoURL',
+          'region',
+          'language',
+          'theme',
+          'userProviders',
+          'userGenres',
+          'autoplay',
+          'dataSaver',
+          'includeAdult',
+          'lastLibraryUpdatedAt',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.uid == request.auth.uid &&
+        data.displayName is string && data.displayName.size() <= 100 &&
+        data.photoURL is string && data.photoURL.size() <= 500 &&
+        data.region is string && data.region.size() >= 2 && data.region.size() <= 5 && data.region.matches('^[A-Z]{2,5}$') &&
+        data.language is string && data.language.size() >= 2 && data.language.size() <= 10 && data.language.matches('^[a-zA-Z\\-]{2,10}$') &&
+        data.theme is string && data.theme.size() <= 20 && (data.theme == 'indigo' || data.theme == 'crimson' || data.theme == 'emerald' || data.theme == 'gold' || data.theme == 'violet') &&
+        data.userProviders is list && data.userProviders.size() <= 50 && (data.userProviders.size() == 0 || data.userProviders[0] is number) &&
+        data.userGenres is list && data.userGenres.size() <= 25 && (data.userGenres.size() == 0 || data.userGenres[0] is number) &&
+        data.autoplay is bool &&
+        data.dataSaver is bool &&
+        data.includeAdult is bool &&
+        data.lastLibraryUpdatedAt is string && data.lastLibraryUpdatedAt.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidWatchlistItem(data) {
+      return data.keys().hasAll([
+          'uid',
+          'mediaKey',
+          'mediaId',
+          'mediaType',
+          'title',
+          'posterPath',
+          'backdropPath',
+          'releaseDate',
+          'voteAverage',
+          'overview',
+          'addedAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid',
+          'mediaKey',
+          'mediaId',
+          'mediaType',
+          'title',
+          'posterPath',
+          'backdropPath',
+          'releaseDate',
+          'voteAverage',
+          'overview',
+          'addedAt',
+          'updatedAt'
+        ]) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.uid == request.auth.uid &&
+        data.mediaKey is string && data.mediaKey.size() >= 3 && data.mediaKey.size() <= 64 && data.mediaKey.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.mediaId is number && data.mediaId > 0 &&
+        data.mediaType is string && data.mediaType.size() <= 10 && (data.mediaType == 'movie' || data.mediaType == 'tv') &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 300 &&
+        data.posterPath is string && data.posterPath.size() <= 300 &&
+        data.backdropPath is string && data.backdropPath.size() <= 300 &&
+        data.releaseDate is string && data.releaseDate.size() <= 30 &&
+        data.voteAverage is number && data.voteAverage >= 0 && data.voteAverage <= 10 &&
+        data.overview is string && data.overview.size() <= 2000 &&
+        data.addedAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidWatchProgress(data) {
+      return data.keys().hasAll([
+          'uid',
+          'mediaKey',
+          'mediaId',
+          'mediaType',
+          'isCompleted',
+          'watchedEpisodes',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid',
+          'mediaKey',
+          'mediaId',
+          'mediaType',
+          'isCompleted',
+          'watchedEpisodes',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.uid == request.auth.uid &&
+        data.mediaKey is string && data.mediaKey.size() >= 3 && data.mediaKey.size() <= 64 && data.mediaKey.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.mediaId is number && data.mediaId > 0 &&
+        data.mediaType is string && data.mediaType.size() <= 10 && (data.mediaType == 'movie' || data.mediaType == 'tv') &&
+        data.isCompleted is bool &&
+        data.watchedEpisodes is list && data.watchedEpisodes.size() <= 500 && (data.watchedEpisodes.size() == 0 || data.watchedEpisodes[0] is number) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // --- Collection Rules ---
+
+    // 1. User Profiles (/users/{userId})
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if false;
+
+      allow create: if isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == userId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName',
+          'photoURL',
+          'region',
+          'language',
+          'theme',
+          'userProviders',
+          'userGenres',
+          'autoplay',
+          'dataSaver',
+          'includeAdult',
+          'lastLibraryUpdatedAt',
+          'updatedAt'
+        ]);
+
+      allow delete: if isOwner(userId) && isValidId(userId);
+
+      // 2. User Watchlist Subcollection (/users/{userId}/watchlist/{mediaKey})
+      match /watchlist/{mediaKey} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(mediaKey) && existing().uid == request.auth.uid;
+        allow list: if isOwner(userId) && existing().uid == request.auth.uid;
+
+        allow create: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(mediaKey) &&
+          isValidWatchlistItem(incoming()) &&
+          incoming().uid == userId &&
+          incoming().mediaKey == mediaKey &&
+          incoming().addedAt == request.time &&
+          incoming().updatedAt == request.time &&
+          parentUserExists(userId);
+
+        allow update: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(mediaKey) &&
+          isValidWatchlistItem(incoming()) &&
+          incoming().uid == existing().uid &&
+          incoming().mediaKey == existing().mediaKey &&
+          incoming().mediaId == existing().mediaId &&
+          incoming().mediaType == existing().mediaType &&
+          incoming().addedAt == existing().addedAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title',
+            'posterPath',
+            'backdropPath',
+            'releaseDate',
+            'voteAverage',
+            'overview',
+            'updatedAt'
+          ]) &&
+          parentUserExists(userId);
+
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(mediaKey) && existing().uid == request.auth.uid && parentUserExists(userId);
+      }
+
+      // 3. User Watch Progress Subcollection (/users/{userId}/progress/{mediaKey})
+      match /progress/{mediaKey} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(mediaKey) && existing().uid == request.auth.uid;
+        allow list: if isOwner(userId) && existing().uid == request.auth.uid;
+
+        allow create: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(mediaKey) &&
+          isValidWatchProgress(incoming()) &&
+          incoming().uid == userId &&
+          incoming().mediaKey == mediaKey &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          parentUserExists(userId);
+
+        allow update: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(mediaKey) &&
+          isValidWatchProgress(incoming()) &&
+          incoming().uid == existing().uid &&
+          incoming().mediaKey == existing().mediaKey &&
+          incoming().mediaId == existing().mediaId &&
+          incoming().mediaType == existing().mediaType &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'isCompleted',
+            'watchedEpisodes',
+            'updatedAt'
+          ]) &&
+          parentUserExists(userId);
+
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(mediaKey) && existing().uid == request.auth.uid && parentUserExists(userId);
+      }
+    }
+
+    // 4. L2 Regional Shared Cache (/regionalCache/{cacheKey})
+    function isValidRegionalCacheEntry(data) {
+      return data.keys().hasAll([
+          'cacheKey',
+          'region',
+          'language',
+          'endpoint',
+          'payloadJson',
+          'expiresAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'cacheKey',
+          'region',
+          'language',
+          'endpoint',
+          'payloadJson',
+          'expiresAt',
+          'updatedAt'
+        ]) &&
+        data.cacheKey is string && isValidId(data.cacheKey) &&
+        data.region is string && data.region.size() >= 2 && data.region.size() <= 5 && data.region.matches('^[A-Z]{2,5}$') &&
+        data.language is string && data.language.size() >= 2 && data.language.size() <= 10 && data.language.matches('^[a-zA-Z\\-]{2,10}$') &&
+        data.endpoint is string && data.endpoint.size() >= 1 && data.endpoint.size() <= 200 &&
+        data.payloadJson is string && data.payloadJson.size() >= 2 && data.payloadJson.size() <= 900000 &&
+        data.expiresAt is number && data.expiresAt > 0 &&
+        data.updatedAt is number && data.updatedAt > 0;
+    }
+
+    match /regionalCache/{cacheKey} {
+      allow get: if isValidId(cacheKey);
+      allow list: if false;
+      allow create, update: if isValidId(cacheKey) &&
+        isValidRegionalCacheEntry(incoming()) &&
+        incoming().cacheKey == cacheKey;
+      allow delete: if false;
+    }
+
+    // 5. Zero-Credential Server Proxy Queue (/tmdbProxyQueue/{requestId})
+    function isValidTmdbProxyQueueEntry(data) {
+      return data.keys().hasAll([
+          'requestId',
+          'cacheKey',
+          'endpoint',
+          'queryJson',
+          'region',
+          'language',
+          'status',
+          'statusCode',
+          'responseJson',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'requestId',
+          'cacheKey',
+          'endpoint',
+          'queryJson',
+          'region',
+          'language',
+          'status',
+          'statusCode',
+          'responseJson',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.requestId is string && isValidId(data.requestId) &&
+        data.cacheKey is string && isValidId(data.cacheKey) &&
+        data.endpoint is string && data.endpoint.size() >= 1 && data.endpoint.size() <= 200 &&
+        data.queryJson is string && data.queryJson.size() >= 2 && data.queryJson.size() <= 1000 &&
+        data.region is string && data.region.size() >= 2 && data.region.size() <= 5 && data.region.matches('^[A-Z]{2,5}$') &&
+        data.language is string && data.language.size() >= 2 && data.language.size() <= 10 && data.language.matches('^[a-zA-Z\\-]{2,10}$') &&
+        data.status is string && (data.status == 'pending' || data.status == 'completed' || data.status == 'error') &&
+        data.statusCode is number && data.statusCode >= 0 && data.statusCode <= 599 &&
+        data.responseJson is string && data.responseJson.size() <= 900000 &&
+        data.createdAt is number && data.createdAt > 0 &&
+        data.updatedAt is number && data.updatedAt > 0;
+    }
+
+    match /tmdbProxyQueue/{requestId} {
+      allow get: if isValidId(requestId);
+      allow list: if resource.data.status == 'pending';
+      allow create, update: if isValidId(requestId) &&
+        isValidTmdbProxyQueueEntry(incoming()) &&
+        incoming().requestId == requestId;
+      allow delete: if isValidId(requestId);
+    }
+
+    // 6. Server-Encrypted TMDB Key Pool Vault (/serverKeyVault/{vaultId})
+    function isValidServerKeyVaultEntry(data) {
+      return data.keys().hasAll([
+          'vaultId',
+          'encryptedPayload',
+          'keyCount',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'vaultId',
+          'encryptedPayload',
+          'keyCount',
+          'updatedAt'
+        ]) &&
+        data.vaultId is string && isValidId(data.vaultId) &&
+        data.encryptedPayload is string && data.encryptedPayload.size() >= 10 && data.encryptedPayload.size() <= 20000 &&
+        data.keyCount is number && data.keyCount >= 0 && data.keyCount <= 25 &&
+        data.updatedAt is number && data.updatedAt > 0;
+    }
+
+    match /serverKeyVault/{vaultId} {
+      allow get: if isValidId(vaultId);
+      allow list: if false;
+      allow create, update: if isValidId(vaultId) &&
+        isValidServerKeyVaultEntry(incoming()) &&
+        incoming().vaultId == vaultId;
+      allow delete: if false;
+    }
+
+    // 7. Server-Encrypted User 2FA Vault (/userSecurityVault/{userId})
+    function isValidUserSecurityVaultEntry(data) {
+      return data.keys().hasAll([
+          'uid',
+          'twoFactorEnabled',
+          'encryptedTotpSecret',
+          'backupCodeHashesJson',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid',
+          'twoFactorEnabled',
+          'encryptedTotpSecret',
+          'backupCodeHashesJson',
+          'updatedAt'
+        ]) &&
+        data.uid is string && isValidId(data.uid) &&
+        data.twoFactorEnabled is bool &&
+        data.encryptedTotpSecret is string && data.encryptedTotpSecret.size() <= 2000 &&
+        data.backupCodeHashesJson is string && data.backupCodeHashesJson.size() >= 2 && data.backupCodeHashesJson.size() <= 4000 &&
+        data.updatedAt is number && data.updatedAt > 0;
+    }
+
+    match /userSecurityVault/{userId} {
+      allow get: if isValidId(userId);
+      allow list: if false;
+      allow create, update: if isValidId(userId) &&
+        isValidUserSecurityVaultEntry(incoming()) &&
+        incoming().uid == userId;
+      allow delete: if isValidId(userId);
+    }
+  }
+}

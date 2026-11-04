@@ -1,0 +1,520 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user profile storing regional preferences, theme, active streaming subscriptions, and library sync version timestamp.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the profile owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name of the user.",
+          "minLength": 0,
+          "maxLength": 100
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Profile avatar URL.",
+          "minLength": 0,
+          "maxLength": 500
+        },
+        "region": {
+          "type": "string",
+          "description": "Configured ISO-3166-1 region code (e.g. DE, US, GB).",
+          "minLength": 2,
+          "maxLength": 5,
+          "pattern": "^[A-Z]{2,5}$"
+        },
+        "language": {
+          "type": "string",
+          "description": "Configured BCP-47 language tag (e.g. de-DE, en-US).",
+          "minLength": 2,
+          "maxLength": 10,
+          "pattern": "^[a-zA-Z\\-]{2,10}$"
+        },
+        "theme": {
+          "type": "string",
+          "description": "UI color theme.",
+          "enum": ["indigo", "crimson", "emerald", "gold", "violet"],
+          "maxLength": 20
+        },
+        "userProviders": {
+          "type": "array",
+          "description": "Subscribed TMDB watch provider IDs (bounded <= 50)."
+        },
+        "userGenres": {
+          "type": "array",
+          "description": "Preferred TMDB genre IDs (bounded <= 25)."
+        },
+        "autoplay": {
+          "type": "boolean",
+          "description": "Whether 10-second trailer autoplay is enabled on DetailView."
+        },
+        "dataSaver": {
+          "type": "boolean",
+          "description": "Whether optimized image resolutions should be used."
+        },
+        "includeAdult": {
+          "type": "boolean",
+          "description": "Whether 18+ content is included in discovery."
+        },
+        "lastLibraryUpdatedAt": {
+          "type": "string",
+          "description": "ISO timestamp string marking the last change to watchlist or progress subcollections for zero-read local diff sync.",
+          "minLength": 0,
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the profile was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the profile was last updated."
+        }
+      },
+      "required": [
+        "uid",
+        "displayName",
+        "photoURL",
+        "region",
+        "language",
+        "theme",
+        "userProviders",
+        "userGenres",
+        "autoplay",
+        "dataSaver",
+        "includeAdult",
+        "lastLibraryUpdatedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "WatchlistItem": {
+      "title": "WatchlistItem",
+      "description": "A single movie or TV series saved in a user's personal watchlist subcollection.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "mediaKey": {
+          "type": "string",
+          "description": "Composite key in format movie_<id> or tv_<id>.",
+          "minLength": 3,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "mediaId": {
+          "type": "number",
+          "description": "Numeric TMDB ID."
+        },
+        "mediaType": {
+          "type": "string",
+          "description": "Media type: movie or tv.",
+          "enum": ["movie", "tv"],
+          "maxLength": 10
+        },
+        "title": {
+          "type": "string",
+          "description": "Localized movie title or TV series name.",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "posterPath": {
+          "type": "string",
+          "description": "TMDB poster path or empty string.",
+          "minLength": 0,
+          "maxLength": 300
+        },
+        "backdropPath": {
+          "type": "string",
+          "description": "TMDB backdrop path or empty string.",
+          "minLength": 0,
+          "maxLength": 300
+        },
+        "releaseDate": {
+          "type": "string",
+          "description": "Release date or first air date string.",
+          "minLength": 0,
+          "maxLength": 30
+        },
+        "voteAverage": {
+          "type": "number",
+          "description": "TMDB vote average score."
+        },
+        "overview": {
+          "type": "string",
+          "description": "Truncated synopsis (<= 2000 chars).",
+          "minLength": 0,
+          "maxLength": 2000
+        },
+        "addedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the item was added."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the item was updated."
+        }
+      },
+      "required": [
+        "uid",
+        "mediaKey",
+        "mediaId",
+        "mediaType",
+        "title",
+        "posterPath",
+        "backdropPath",
+        "releaseDate",
+        "voteAverage",
+        "overview",
+        "addedAt",
+        "updatedAt"
+      ]
+    },
+    "WatchProgress": {
+      "title": "WatchProgress",
+      "description": "Tracks watched status for a movie or episode-level progress for a TV series.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "mediaKey": {
+          "type": "string",
+          "description": "Composite key in format movie_<id> or tv_<id>.",
+          "minLength": 3,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "mediaId": {
+          "type": "number",
+          "description": "Numeric TMDB ID."
+        },
+        "mediaType": {
+          "type": "string",
+          "description": "Media type: movie or tv.",
+          "enum": ["movie", "tv"],
+          "maxLength": 10
+        },
+        "isCompleted": {
+          "type": "boolean",
+          "description": "True if the movie is watched or the TV show is marked completed."
+        },
+        "watchedEpisodes": {
+          "type": "array",
+          "description": "Bounded list of watched TMDB episode IDs (<= 500)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when progress record was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when progress record was last updated."
+        }
+      },
+      "required": [
+        "uid",
+        "mediaKey",
+        "mediaId",
+        "mediaType",
+        "isCompleted",
+        "watchedEpisodes",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "RegionRegistryEntry": {
+      "title": "RegionRegistryEntry",
+      "description": "Tracks active user region + language combinations for server-side pre-warming.",
+      "type": "object",
+      "properties": {
+        "regionLangId": {
+          "type": "string",
+          "description": "Identifier in format <REGION>_<LANG> (e.g. DE_de-DE).",
+          "minLength": 4,
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "region": {
+          "type": "string",
+          "description": "ISO region code (e.g. DE).",
+          "minLength": 2,
+          "maxLength": 5
+        },
+        "language": {
+          "type": "string",
+          "description": "Language code (e.g. de-DE).",
+          "minLength": 2,
+          "maxLength": 10
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last heartbeat."
+        }
+      },
+      "required": ["regionLangId", "region", "language", "updatedAt"]
+    },
+    "RegionalCacheEntry": {
+      "title": "RegionalCacheEntry",
+      "description": "L2 persistent shared regional TMDB response cache managed by the server.",
+      "type": "object",
+      "properties": {
+        "cacheKey": {
+          "type": "string",
+          "description": "Safe alphanumeric hash key of region + language + endpoint + query.",
+          "minLength": 4,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "region": {
+          "type": "string",
+          "description": "ISO region code.",
+          "minLength": 2,
+          "maxLength": 5
+        },
+        "language": {
+          "type": "string",
+          "description": "Language code.",
+          "minLength": 2,
+          "maxLength": 10
+        },
+        "endpoint": {
+          "type": "string",
+          "description": "TMDB endpoint path.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "payloadJson": {
+          "type": "string",
+          "description": "Serialized TMDB response payload (<= 900KB).",
+          "minLength": 2,
+          "maxLength": 900000
+        },
+        "expiresAt": {
+          "type": "number",
+          "description": "Expiration timestamp in epoch milliseconds."
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Update timestamp in epoch milliseconds."
+        }
+      },
+      "required": [
+        "cacheKey",
+        "region",
+        "language",
+        "endpoint",
+        "payloadJson",
+        "expiresAt",
+        "updatedAt"
+      ]
+    },
+    "TmdbProxyQueueEntry": {
+      "title": "TmdbProxyQueueEntry",
+      "description": "Zero-credential proxy request queue bridging native iOS clients with the Cloud Run server proxy cache.",
+      "type": "object",
+      "properties": {
+        "requestId": {
+          "type": "string",
+          "description": "Safe alphanumeric request ID matching cacheKey.",
+          "minLength": 4,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "cacheKey": {
+          "type": "string",
+          "description": "Deterministic regional cache key.",
+          "minLength": 4,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "endpoint": {
+          "type": "string",
+          "description": "TMDB endpoint path.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "queryJson": {
+          "type": "string",
+          "description": "Serialized query parameters without credentials.",
+          "minLength": 2,
+          "maxLength": 1000
+        },
+        "region": {
+          "type": "string",
+          "description": "ISO region code.",
+          "minLength": 2,
+          "maxLength": 5
+        },
+        "language": {
+          "type": "string",
+          "description": "Language code.",
+          "minLength": 2,
+          "maxLength": 10
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "completed", "error"],
+          "maxLength": 16
+        },
+        "statusCode": {
+          "type": "number",
+          "description": "HTTP status code from server proxy."
+        },
+        "responseJson": {
+          "type": "string",
+          "description": "Serialized response payload from server proxy.",
+          "minLength": 0,
+          "maxLength": 900000
+        },
+        "createdAt": {
+          "type": "number",
+          "description": "Creation timestamp in epoch milliseconds."
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Update timestamp in epoch milliseconds."
+        }
+      },
+      "required": [
+        "requestId",
+        "cacheKey",
+        "endpoint",
+        "queryJson",
+        "region",
+        "language",
+        "status",
+        "statusCode",
+        "responseJson",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ServerKeyVaultEntry": {
+      "title": "ServerKeyVaultEntry",
+      "description": "AES-256-GCM encrypted server-side TMDB key pool managed exclusively by the backend server.",
+      "type": "object",
+      "properties": {
+        "vaultId": {
+          "type": "string",
+          "description": "Vault identifier (e.g. tmdbPool).",
+          "minLength": 2,
+          "maxLength": 64
+        },
+        "encryptedPayload": {
+          "type": "string",
+          "description": "AES-256-GCM ciphertext containing the encrypted TMDB API keys.",
+          "minLength": 10,
+          "maxLength": 20000
+        },
+        "keyCount": {
+          "type": "number",
+          "description": "Count of encrypted keys in the vault."
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Last update epoch timestamp."
+        }
+      },
+      "required": ["vaultId", "encryptedPayload", "keyCount", "updatedAt"]
+    },
+    "UserSecurityVaultEntry": {
+      "title": "UserSecurityVaultEntry",
+      "description": "AES-256-GCM encrypted 2FA TOTP configuration and salted backup code hashes for a user.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "twoFactorEnabled": {
+          "type": "boolean",
+          "description": "Whether 2FA is active for this user."
+        },
+        "encryptedTotpSecret": {
+          "type": "string",
+          "description": "AES-256-GCM encrypted Base32 TOTP secret.",
+          "minLength": 0,
+          "maxLength": 2000
+        },
+        "backupCodeHashesJson": {
+          "type": "string",
+          "description": "JSON array of SHA-256 salted backup code hashes.",
+          "minLength": 2,
+          "maxLength": 4000
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Last update epoch timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "twoFactorEnabled",
+        "encryptedTotpSecret",
+        "backupCodeHashesJson",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user profile and preferences document."
+    },
+    "/users/{userId}/watchlist/{mediaKey}": {
+      "schema": { "$ref": "#/entities/WatchlistItem" },
+      "description": "Subcollection storing a user's saved watchlist items."
+    },
+    "/users/{userId}/progress/{mediaKey}": {
+      "schema": { "$ref": "#/entities/WatchProgress" },
+      "description": "Subcollection storing a user's watched movies and series episode progress."
+    },
+    "/regionRegistry/{regionLangId}": {
+      "schema": { "$ref": "#/entities/RegionRegistryEntry" },
+      "description": "Registry of active user regions used by the server pre-warmer."
+    },
+    "/regionalCache/{cacheKey}": {
+      "schema": { "$ref": "#/entities/RegionalCacheEntry" },
+      "description": "L2 persistent shared regional TMDB response cache."
+    },
+    "/tmdbProxyQueue/{requestId}": {
+      "schema": { "$ref": "#/entities/TmdbProxyQueueEntry" },
+      "description": "Zero-credential live proxy request queue processed by the Cloud Run server."
+    },
+    "/serverKeyVault/{vaultId}": {
+      "schema": { "$ref": "#/entities/ServerKeyVaultEntry" },
+      "description": "AES-256-GCM encrypted server TMDB key pool."
+    },
+    "/userSecurityVault/{userId}": {
+      "schema": { "$ref": "#/entities/UserSecurityVaultEntry" },
+      "description": "AES-256-GCM encrypted 2FA TOTP secrets and backup code hashes."
+    }
+  }
+}
