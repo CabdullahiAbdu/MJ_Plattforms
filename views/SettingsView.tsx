@@ -1206,15 +1206,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </section>
 
-        {/* Official TMDB Attribution Footer */}
-        <footer className="pt-4 pb-2 flex flex-col items-center text-center gap-2 opacity-60">
-          <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-md bg-[#0d253f] border border-[#01b4e4]/30">
-            <span className="text-[10px] font-black tracking-widest bg-gradient-to-r from-[#90cea1] to-[#01b4e4] bg-clip-text text-transparent">
+        {/* Official TMDB & Streaming Availability Attribution Footer (LEG-01) */}
+        <footer className="pt-4 pb-2 flex flex-col items-center text-center gap-2 opacity-85">
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-md bg-[#0d253f] border border-[#01b4e4]/40">
+            <span className="text-[11px] font-black tracking-widest bg-gradient-to-r from-[#90cea1] to-[#01b4e4] bg-clip-text text-transparent">
               TMDB
             </span>
           </div>
-          <p className="text-[11px] text-zinc-500 max-w-sm leading-relaxed">
-            This product uses the TMDB API but is not endorsed or certified by TMDB.
+          <p className="text-[11px] text-zinc-400 max-w-md leading-relaxed">
+            This product uses the TMDB API but is not endorsed or certified by TMDB. Streaming-Verfügbarkeitsdaten bereitgestellt von JustWatch via TMDB. MovieJournal ist ein Entdeckungs- und Tracking-Dienst und kein eigener Streaming-Anbieter.
           </p>
         </footer>
       </div>

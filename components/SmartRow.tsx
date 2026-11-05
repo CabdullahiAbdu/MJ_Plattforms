@@ -26,9 +26,16 @@ export const SmartRow: React.FC<SmartRowProps> = ({
   onSeeAll,
 }) => {
   const [items, setItems] = useState<MediaItem[]>(initialItems || []);
+  const [initialLoading, setInitialLoading] = useState<boolean>(
+    !(initialItems && initialItems.length > 0)
+  );
+  const [isNearViewport, setIsNearViewport] = useState<boolean>(
+    Boolean(initialItems && initialItems.length > 0)
+  );
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
   const rowRef = useRef<HTMLDivElement>(null);
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
@@ -37,14 +44,37 @@ export const SmartRow: React.FC<SmartRowProps> = ({
   const effectiveKey = queryKey || title;
 
   useEffect(() => {
+    if (isNearViewport) return;
+    if (typeof IntersectionObserver === 'undefined' || !containerRef.current) {
+      setIsNearViewport(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setIsNearViewport(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '400px 0px' }
+    );
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, [isNearViewport]);
+
+  useEffect(() => {
     if (initialItems && initialItems.length > 0) {
       setItems(initialItems);
+      setInitialLoading(false);
       setPage(1);
       setHasMore(true);
       return;
     }
 
+    if (!isNearViewport) return;
+
     let mounted = true;
+    setInitialLoading(true);
     const load = async () => {
       try {
         const data = await fetcherRef.current(1);
@@ -54,13 +84,17 @@ export const SmartRow: React.FC<SmartRowProps> = ({
         }
       } catch (e) {
         console.error('SmartRow load failed', e);
+      } finally {
+        if (mounted) {
+          setInitialLoading(false);
+        }
       }
     };
     load();
     return () => {
       mounted = false;
     };
-  }, [effectiveKey, initialItems]);
+  }, [effectiveKey, initialItems, isNearViewport]);
 
   const scroll = (direction: 'left' | 'right') => {
     if (rowRef.current) {
@@ -98,10 +132,11 @@ export const SmartRow: React.FC<SmartRowProps> = ({
     }
   };
 
-  if (!items.length || !tmdb) return null;
+  if (!tmdb) return null;
+  if (!initialLoading && items.length === 0) return null;
 
   return (
-    <div className="group/row relative z-10 mb-6 sm:mb-8">
+    <div ref={containerRef} className="group/row relative z-10 mb-6 sm:mb-8">
       <div className="flex items-center justify-between pr-[var(--fluid-page-px)] mb-3">
         <div
           className={`flex items-center gap-2 ${
@@ -167,16 +202,27 @@ export const SmartRow: React.FC<SmartRowProps> = ({
           onScroll={handleScroll}
           className="flex gap-[clamp(0.65rem,1.8vw,1rem)] overflow-x-auto overflow-y-hidden pb-3 pt-1 pr-6 no-scrollbar ios-touch-rail"
         >
-          {items.map((item) => (
-            <div key={item.id} className="flex-shrink-0">
-              <MediaCard
-                item={item}
-                onClick={onClick}
-                imageUrl={tmdb.getImageUrl(item.poster_path || item.backdrop_path, 'w500')}
-                tmdb={tmdb}
-              />
-            </div>
-          ))}
+          {initialLoading && items.length === 0
+            ? Array.from({ length: 7 }).map((_, idx) => (
+                <div
+                  key={`skel-${idx}`}
+                  style={{ width: 'var(--fluid-card-w)' }}
+                  className="flex-shrink-0"
+                >
+                  <div className="aspect-[2/3] rounded-2xl bg-zinc-900/90 cinema-shimmer" />
+                  <div className="h-3.5 w-3/4 rounded bg-zinc-900/80 mt-2" />
+                </div>
+              ))
+            : items.map((item) => (
+                <div key={item.id} className="flex-shrink-0">
+                  <MediaCard
+                    item={item}
+                    onClick={onClick}
+                    imageUrl={tmdb.getImageUrl(item.poster_path || item.backdrop_path, 'w500')}
+                    tmdb={tmdb}
+                  />
+                </div>
+              ))}
           {loadingMore && (
             <div className="flex items-center justify-center min-w-[90px]">
               <div className="w-6 h-6 border-2 border-zinc-600 border-t-zinc-300 rounded-full animate-spin" />

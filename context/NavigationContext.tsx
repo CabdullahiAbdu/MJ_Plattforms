@@ -136,10 +136,13 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     });
   }, []);
 
+  const hadDetailRef = useRef<boolean>(Boolean(initialRoute.overlay));
+
   // --- Sync State -> Browser URL Hash for Shareable Deep Links & Back Button ---
   useEffect(() => {
     if (isPopStateRef.current) {
       isPopStateRef.current = false;
+      hadDetailRef.current = Boolean(expandingItem || overlayStack.length > 0);
       return;
     }
 
@@ -164,10 +167,24 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       }
     }
 
+    const hasDetailNow = Boolean(expandingItem || overlayStack.length > 0);
+    const shouldPushHistory = !hadDetailRef.current && hasDetailNow;
+    hadDetailRef.current = hasDetailNow;
+
     const newHash = `#${params.toString()}`;
     try {
       if (typeof window !== 'undefined' && window.location.hash !== newHash) {
-        if (window.history && typeof window.history.replaceState === 'function') {
+        const isVidaaTv =
+          window.location.search.includes('vidaa=1') ||
+          /VIDAA|Hisense/i.test(navigator.userAgent || '');
+        if (
+          !isVidaaTv &&
+          shouldPushHistory &&
+          window.history &&
+          typeof window.history.pushState === 'function'
+        ) {
+          window.history.pushState(null, '', newHash);
+        } else if (window.history && typeof window.history.replaceState === 'function') {
           window.history.replaceState(null, '', newHash);
         }
       }

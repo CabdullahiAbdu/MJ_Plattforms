@@ -1,8 +1,4 @@
 import {
-  doc,
-  getDoc,
-} from 'firebase/firestore';
-import {
   MediaItem,
   MediaType,
   MovieDetails,
@@ -27,39 +23,10 @@ import {
   resolveMediaType,
 } from '../types';
 import { globalOrchestrator, RequestPriority } from './requestOrchestrator';
-import { db } from './firebase';
-import firebaseConfig from '../firebase-applet-config.json';
+import { auth } from './firebase';
 
-const FIRESTORE_REST_BASE = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents`;
-const FIRESTORE_WEB_KEY = firebaseConfig.apiKey;
 const CLOUD_RUN_SHARED_ORIGIN =
   'https://ais-pre-37sas3mekyso6nio5hh72d-849714710389.europe-west2.run.app';
-
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit = {},
-  timeoutMs: number = 4500,
-  parentSignal?: AbortSignal
-): Promise<Response> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  const onParentAbort = () => ctrl.abort();
-  if (parentSignal) {
-    if (parentSignal.aborted) {
-      clearTimeout(timer);
-      throw new DOMException('Aborted', 'AbortError');
-    }
-    parentSignal.addEventListener('abort', onParentAbort, { once: true });
-  }
-  try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
-  } finally {
-    clearTimeout(timer);
-    if (parentSignal) {
-      parentSignal.removeEventListener('abort', onParentAbort);
-    }
-  }
-}
 
 export function isNativePlatform(): boolean {
   if (typeof window === 'undefined') return false;
@@ -277,182 +244,7 @@ export class TmdbService {
     return `agg:${this.language}:${this.region}:${view}:${type}:${id}`;
   }
 
-  // --- CORE ORCHESTRATED ZERO-CREDENTIAL PROXY FETCH (HTTP + DIRECT FIRESTORE REST L2 BRIDGE) ---
-
-  private enqueueBackgroundRefreshRest(
-    cacheKey: string,
-    cleanEndpoint: string,
-    queryObj: Record<string, string>,
-    safeRegion: string,
-    safeLanguage: string
-  ): void {
-    const now = Date.now();
-    const queueUrl = `${FIRESTORE_REST_BASE}/tmdbProxyQueue/${encodeURIComponent(cacheKey)}?key=${encodeURIComponent(FIRESTORE_WEB_KEY)}`;
-    fetch(queueUrl, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        fields: {
-          requestId: { stringValue: cacheKey },
-          cacheKey: { stringValue: cacheKey },
-          endpoint: { stringValue: cleanEndpoint.slice(0, 200) },
-          queryJson: { stringValue: JSON.stringify(queryObj).slice(0, 1000) },
-          region: { stringValue: safeRegion },
-          language: { stringValue: safeLanguage },
-          status: { stringValue: 'pending' },
-          statusCode: { integerValue: '0' },
-          responseJson: { stringValue: '' },
-          createdAt: { integerValue: String(now) },
-          updatedAt: { integerValue: String(now) },
-        },
-      }),
-    }).catch(() => {});
-  }
-
-  private async fetchViaFirestoreProxyBridge<T>(
-    cleanEndpoint: string,
-    queryObj: Record<string, string>,
-    signal?: AbortSignal
-  ): Promise<T> {
-    const safeRegion =
-      (this.region || 'DE').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 5) || 'DE';
-    const safeLanguage =
-      (this.language || 'de-DE').replace(/[^a-zA-Z\-]/g, '').slice(0, 10) || 'de-DE';
-    const cacheKey = computeDeterministicCacheKey(
-      safeRegion,
-      safeLanguage,
-      cleanEndpoint,
-      queryObj
-    );
-
-    const cacheRestUrl = `${FIRESTORE_REST_BASE}/regionalCache/${encodeURIComponent(cacheKey)}?key=${encodeURIComponent(FIRESTORE_WEB_KEY)}`;
-    const queueRestUrl = `${FIRESTORE_REST_BASE}/tmdbProxyQueue/${encodeURIComponent(cacheKey)}?key=${encodeURIComponent(FIRESTORE_WEB_KEY)}`;
-
-    // 1. Ultra-Fast Direct REST Read from Shared L2 Regional Cache (/regionalCache/{cacheKey})
-    try {
-      const restRes = await fetchWithTimeout(cacheRestUrl, { method: 'GET' }, 4000, signal);
-      if (restRes.ok) {
-        const docJson = await restRes.json();
-        const payloadJson = docJson?.fields?.payloadJson?.stringValue;
-        const expiresAt = Number(
-          docJson?.fields?.expiresAt?.integerValue ||
-            docJson?.fields?.expiresAt?.doubleValue ||
-            0
-        );
-        if (typeof payloadJson === 'string' && payloadJson.length >= 2) {
-          const parsed = JSON.parse(payloadJson) as T;
-          if (expiresAt <= Date.now()) {
-            this.enqueueBackgroundRefreshRest(
-              cacheKey,
-              cleanEndpoint,
-              queryObj,
-              safeRegion,
-              safeLanguage
-            );
-          }
-          return parsed;
-        }
-      }
-    } catch (err: any) {
-      if (err?.name === 'AbortError' && signal?.aborted) {
-        throw err;
-      }
-      try {
-        const snap = await Promise.race([
-          getDoc(doc(db, 'regionalCache', cacheKey)),
-          new Promise<null>((r) => setTimeout(() => r(null), 2000)),
-        ]);
-        if (snap && snap.exists()) {
-          const d = snap.data();
-          if (typeof d?.payloadJson === 'string' && d.payloadJson.length >= 2) {
-            return JSON.parse(d.payloadJson) as T;
-          }
-        }
-      } catch {
-        // continue to queue
-      }
-    }
-
-    if (signal?.aborted) {
-      throw new DOMException('Aborted', 'AbortError');
-    }
-
-    // 2. Cache Miss: Enqueue request in /tmdbProxyQueue/{cacheKey} via Direct REST PATCH
-    const now = Date.now();
-    await fetchWithTimeout(
-      queueRestUrl,
-      {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          fields: {
-            requestId: { stringValue: cacheKey },
-            cacheKey: { stringValue: cacheKey },
-            endpoint: { stringValue: cleanEndpoint.slice(0, 200) },
-            queryJson: { stringValue: JSON.stringify(queryObj).slice(0, 1000) },
-            region: { stringValue: safeRegion },
-            language: { stringValue: safeLanguage },
-            status: { stringValue: 'pending' },
-            statusCode: { integerValue: '0' },
-            responseJson: { stringValue: '' },
-            createdAt: { integerValue: String(now) },
-            updatedAt: { integerValue: String(now) },
-          },
-        }),
-      },
-      4500,
-      signal
-    );
-
-    // 3. Poll /tmdbProxyQueue/{cacheKey} (and /regionalCache/{cacheKey}) via Direct REST GET
-    const maxAttempts = 28;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      if (signal?.aborted) {
-        throw new DOMException('Aborted', 'AbortError');
-      }
-      await new Promise((r) => setTimeout(r, attempt < 4 ? 220 : 350));
-      if (signal?.aborted) {
-        throw new DOMException('Aborted', 'AbortError');
-      }
-
-      try {
-        const pollRes = await fetchWithTimeout(queueRestUrl, { method: 'GET' }, 3000, signal);
-        if (pollRes.ok) {
-          const qDoc = await pollRes.json();
-          const status = qDoc?.fields?.status?.stringValue;
-          const responseJson = qDoc?.fields?.responseJson?.stringValue;
-          const statusCode = Number(qDoc?.fields?.statusCode?.integerValue || 500);
-
-          if (status === 'completed' && typeof responseJson === 'string' && responseJson.length >= 2) {
-            fetch(queueRestUrl, { method: 'DELETE' }).catch(() => {});
-            return JSON.parse(responseJson) as T;
-          }
-          if (status === 'error') {
-            fetch(queueRestUrl, { method: 'DELETE' }).catch(() => {});
-            throw new Error(`Server Proxy Error (${statusCode})`);
-          }
-        } else if (pollRes.status === 404 && attempt >= 1) {
-          const cRes = await fetchWithTimeout(cacheRestUrl, { method: 'GET' }, 3000, signal);
-          if (cRes.ok) {
-            const cDoc = await cRes.json();
-            const payloadJson = cDoc?.fields?.payloadJson?.stringValue;
-            if (typeof payloadJson === 'string' && payloadJson.length >= 2) {
-              return JSON.parse(payloadJson) as T;
-            }
-          }
-        }
-      } catch (pollErr: any) {
-        if (pollErr?.name === 'AbortError' && signal?.aborted) {
-          throw pollErr;
-        }
-        if (String(pollErr?.message || '').startsWith('Server Proxy Error')) {
-          throw pollErr;
-        }
-      }
-    }
-
-    throw new Error('TMDB Server Proxy timeout.');
-  }
+  // --- CORE ORCHESTRATED HTTPS PROXY FETCH ---
 
   private async fetch<T>(
     endpoint: string,
@@ -494,26 +286,29 @@ export class TmdbService {
       signal: options?.signal,
       execute: async (signal: AbortSignal) => {
         const cleanEndpoint = endpoint.replace(/^\/+/, '');
-        const isNative = isNativePlatform();
-        const customApiBase = (
-          (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_BASE_URL) ||
-          ''
-        ).trim();
-
-        if (isNative && !customApiBase && method === 'GET') {
-          return await this.fetchViaFirestoreProxyBridge<T>(cleanEndpoint, queryObj, signal);
-        }
-
         const queryParams = new URLSearchParams(queryObj);
         const proxyBase = resolveApiBaseUrl('/api/tmdb');
         const url = `${proxyBase}/${cleanEndpoint}?${queryParams.toString()}`;
 
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'x-app-region': this.region,
+        };
+
+        if (method === 'POST' && auth.currentUser) {
+          try {
+            const idToken = await auth.currentUser.getIdToken();
+            if (idToken) {
+              headers.Authorization = `Bearer ${idToken}`;
+            }
+          } catch {
+            // proceed if token retrieval fails
+          }
+        }
+
         const reqInit: RequestInit = {
           method,
-          headers: {
-            'Content-Type': 'application/json',
-            'x-app-region': this.region,
-          },
+          headers,
           signal,
         };
 
@@ -521,38 +316,22 @@ export class TmdbService {
           reqInit.body = JSON.stringify(options.body);
         }
 
-        try {
-          const response = await fetch(url, reqInit);
-          const contentType = response.headers.get('content-type') || '';
+        const response = await fetch(url, reqInit);
 
-          if (
-            method === 'GET' &&
-            (response.redirected || !contentType.includes('application/json'))
-          ) {
-            return await this.fetchViaFirestoreProxyBridge<T>(cleanEndpoint, queryObj, signal);
-          }
-
-          if (!response.ok) {
-            let message = response.statusText || 'Unknown Error';
-            try {
-              const errorData = await response.json();
-              if (errorData && errorData.status_message) {
-                message = errorData.status_message;
-              }
-            } catch {
-              // ignore JSON parse failure
+        if (!response.ok) {
+          let message = response.statusText || 'Unknown Error';
+          try {
+            const errorData = await response.json();
+            if (errorData && errorData.status_message) {
+              message = errorData.status_message;
             }
-            throw new Error(`TMDB Error (${response.status}): ${message}`);
+          } catch {
+            // ignore JSON parse failure
           }
-
-          return await response.json();
-        } catch (err: any) {
-          if (err?.name === 'AbortError') throw err;
-          if (method === 'GET') {
-            return await this.fetchViaFirestoreProxyBridge<T>(cleanEndpoint, queryObj, signal);
-          }
-          throw err;
+          throw new Error(`TMDB Error (${response.status}): ${message}`);
         }
+
+        return await response.json();
       },
     });
   }

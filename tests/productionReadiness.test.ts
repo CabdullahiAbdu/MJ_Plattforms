@@ -40,6 +40,8 @@ import {
   canUseServerFirestoreWrite,
   canUseServerAiCall,
   computeWeakEtag,
+  verifyFirebaseIdToken,
+  isAllowedCorsOrigin,
 } from '../server';
 
 interface TestRecord {
@@ -300,11 +302,12 @@ async function main() {
       watchedEpisodes: { '95396': [103], '83867': [201, 202] },
     });
 
-    // Step 3: Device C (Hisense TV) adds The Bear and removes Dune from Watchlist
+    // Step 3: Device C (Hisense TV) adds The Bear, removes Dune from Watchlist, and unchecks episode 102 of Severance
     const duneKey = getSyncItemMediaKey(duneMovie);
     serverVault = mergeUserSyncLibraryState(serverVault, {
       watchlist: [bearTv],
       removedWatchlistKeys: { [duneKey]: Date.now() },
+      removedEpisodes: { '95396:102': Date.now() },
       manuallyWatchedShows: [136315],
     });
 
@@ -315,7 +318,7 @@ async function main() {
         watchlist: [severanceTv],
         watchedMovies: [693134],
         manuallyWatchedShows: [],
-        watchedEpisodes: { 95396: [101] },
+        watchedEpisodes: { 95396: [101, 102] },
       },
       serverVault as any,
       {
@@ -335,7 +338,8 @@ async function main() {
     assert.deepEqual(finalClientKeys, ['movie_414906', 'tv_136315', 'tv_83867', 'tv_95396']);
     assert.deepEqual(clientMerged.watchedMovies.sort(), [414906, 693134]);
     assert.deepEqual(clientMerged.manuallyWatchedShows, [136315]);
-    assert.deepEqual(clientMerged.watchedEpisodes[95396].sort(), [101, 102, 103, 104]);
+    // Episode 102 was unchecked (tombstoned) on Device C, so only 101, 103, 104 remain watched!
+    assert.deepEqual(clientMerged.watchedEpisodes[95396].sort(), [101, 103, 104]);
     assert.deepEqual(clientMerged.watchedEpisodes[83867].sort(), [201, 202]);
 
     // Verify flushPendingLocalStorageWrites executes cleanly without throwing
@@ -345,16 +349,21 @@ async function main() {
   // ---------------------------------------------------------------------------
   // CYCLE 4: PHASE 9 SECURITY, CRYPTO, QUOTA GUARD & CLOUD RUN HTTP HARDENING
   // ---------------------------------------------------------------------------
-  await runTest('Cycle 4: Security & Cloud Run HTTP', 'AES-256-GCM Vault, RFC 6238 TOTP, HMAC-SHA256 2FA Ticket & Owner Lock', () => {
+  await runTest('Cycle 4: Security & Cloud Run HTTP', 'AES-256-GCM v2 Per-Record Salt Vault, RFC 6238 TOTP, HMAC-SHA256 2FA Ticket & Owner Lock (SEC-03, SEC-05)', () => {
     const secretPlaintext = JSON.stringify({
       uid: 'user-123',
       watchlist: [{ id: 693134, title: 'Dune: Part Two' }],
     });
-    const encrypted = encryptForServerVault(secretPlaintext);
-    assert.equal(decryptFromServerVault(encrypted), secretPlaintext);
+    const encrypted1 = encryptForServerVault(secretPlaintext);
+    const encrypted2 = encryptForServerVault(secretPlaintext);
+    assert.ok(encrypted1.startsWith('v2:'), 'Expected v2 per-record salted format');
+    assert.notEqual(encrypted1, encrypted2, 'Per-record random salt & IV must produce distinct ciphertexts');
+    assert.equal(decryptFromServerVault(encrypted1), secretPlaintext);
+    assert.equal(decryptFromServerVault(encrypted2), secretPlaintext);
 
-    const parts = encrypted.split(':');
-    parts[2] = parts[2].slice(0, -4) + (parts[2].endsWith('ffff') ? '0000' : 'ffff');
+    const parts = encrypted1.split(':');
+    const lastIdx = parts.length - 1;
+    parts[lastIdx] = parts[lastIdx].slice(0, -4) + (parts[lastIdx].endsWith('ffff') ? '0000' : 'ffff');
     assert.equal(decryptFromServerVault(parts.join(':')), null);
 
     const secret = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
@@ -385,6 +394,56 @@ async function main() {
     assert.equal(ALLOWED_TMDB_ENDPOINT_REGEX.test('../admin/secrets'), false);
   });
 
+  await runTest('Cycle 4: Security & Cloud Run HTTP', 'SEC-01, SEC-04 & SEC-06: Cryptographic JWT Fail-Closed, Explicit CORS Allow-List & Rate Limit Tiers', async () => {
+    // 1. SEC-01: Forged / unsigned JWTs must be rejected (fail closed -> null)
+    const nowSec = Math.floor(Date.now() / 1000);
+    const forgedHeader = Buffer.from(JSON.stringify({ alg: 'RS256', kid: 'forged-kid' })).toString('base64url');
+    const forgedPayload = Buffer.from(
+      JSON.stringify({
+        user_id: 'victim-uid',
+        sub: 'victim-uid',
+        email: 'infoc232@gmail.com',
+        aud: 'gen-lang-client-0463426822',
+        iss: 'https://securetoken.google.com/gen-lang-client-0463426822',
+        iat: nowSec - 10,
+        exp: nowSec + 3600,
+      })
+    ).toString('base64url');
+    const forgedToken = `Bearer ${forgedHeader}.${forgedPayload}.forgedSignatureBytes`;
+    const verifiedForged = await verifyFirebaseIdToken(forgedToken);
+    assert.equal(verifiedForged, null, 'Forged unsigned JWT must fail closed and return null');
+
+    const algNoneHeader = Buffer.from(JSON.stringify({ alg: 'none' })).toString('base64url');
+    assert.equal(await verifyFirebaseIdToken(`Bearer ${algNoneHeader}.${forgedPayload}.sig`), null);
+    assert.equal(await verifyFirebaseIdToken(undefined), null);
+
+    // 2. SEC-06: Explicit CORS allow-list rejects foreign .run.app origins
+    assert.equal(
+      isAllowedCorsOrigin('https://ais-dev-37sas3mekyso6nio5hh72d-849714710389.europe-west2.run.app'),
+      true
+    );
+    assert.equal(
+      isAllowedCorsOrigin('https://ais-pre-37sas3mekyso6nio5hh72d-849714710389.europe-west2.run.app'),
+      true
+    );
+    assert.equal(isAllowedCorsOrigin('capacitor://localhost'), true);
+    assert.equal(isAllowedCorsOrigin('https://evil-attacker-12345.europe-west2.run.app'), false);
+    assert.equal(isAllowedCorsOrigin('https://malicious.example.com'), false);
+
+    // 3. SEC-04: Dedicated rate limit tiers for client-error and POST /api/tmdb rating
+    assert.deepEqual(getRateLimitMaxForPath('/api/client-error', 'POST'), {
+      tier: 'client-error',
+      maxPerMinute: 15,
+    });
+    assert.deepEqual(getRateLimitMaxForPath('/api/tmdb/movie/693134/rating', 'POST'), {
+      tier: 'tmdb-rate',
+      maxPerMinute: 20,
+    });
+    const rl = checkTieredRateLimit('127.0.0.1', '/api/client-error', Date.now(), 'POST');
+    assert.equal(rl.allowed, true);
+    assert.equal(rl.limit, 15);
+  });
+
   await runTest('Cycle 4: Security & Cloud Run HTTP', 'Weak ETag generator & DailyCloudQuotaGuard protect bandwidth and free tier', () => {
     const sampleJson = JSON.stringify({ page: 1, results: [{ id: 693134, title: 'Dune: Part Two' }] });
     const etag1 = computeWeakEtag(sampleJson);
@@ -402,7 +461,7 @@ async function main() {
     assert.equal(canUseServerAiCall(), true);
   });
 
-  await runTest('Cycle 4: Security & Cloud Run HTTP', 'Live HTTP: /health, /api/config, /api/admin/tmdb-keys & /vidaa/appinfo.json', async () => {
+  await runTest('Cycle 4: Security & Cloud Run HTTP', 'Live HTTP: /health, /api/config, CSP header, /api/admin/tmdb-keys & SEC-07 rating auth', async () => {
     const healthRes = await fetch('http://127.0.0.1:3000/health');
     assert.equal(healthRes.status, 200);
     const healthBody = await healthRes.json();
@@ -415,6 +474,10 @@ async function main() {
     assert.equal(configRes.headers.get('x-content-type-options'), 'nosniff');
     assert.equal(configRes.headers.get('x-frame-options'), 'SAMEORIGIN');
     assert.equal(configRes.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
+    assert.ok(
+      (configRes.headers.get('content-security-policy') || '').includes("default-src 'self'"),
+      'Expected Content-Security-Policy header on responses'
+    );
 
     const getUnauth = await fetch('http://127.0.0.1:3000/api/admin/tmdb-keys');
     assert.equal(getUnauth.status, 401);

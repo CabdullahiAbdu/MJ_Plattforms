@@ -52,12 +52,6 @@ class RootErrorBoundary extends React.Component<
   { children: React.ReactNode },
   ErrorBoundaryState
 > {
-  declare props: { children: React.ReactNode };
-  declare setState: (
-    updater:
-      | Partial<ErrorBoundaryState>
-      | ((prevState: ErrorBoundaryState) => Partial<ErrorBoundaryState>)
-  ) => void;
   public state: ErrorBoundaryState = { hasError: false, errorMsg: '', retryCount: 0 };
   private keyListener: ((e: KeyboardEvent) => void) | null = null;
   private autoRetryTimer: number | null = null;
@@ -208,3 +202,9 @@ root.render(
     <App />
   </RootErrorBoundary>
 );
+
+if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
+}

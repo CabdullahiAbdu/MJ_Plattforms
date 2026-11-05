@@ -2,11 +2,11 @@
 <html lang="de" class="dark">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#000000" />
-    <meta name="description" content="A premium, Apple TV-inspired movie and TV catalogue powered by TMDB." />
+    <meta name="description" content="Entdecke, verfolge und kuratiere Filme & Serien auf iPhone, iPad, Desktop und Smart TV – powered by TMDB." />
     <meta property="og:title" content="MovieJournal" />
-    <meta property="og:description" content="A premium, Apple TV-inspired movie and TV catalogue powered by TMDB." />
+    <meta property="og:description" content="Entdecke, verfolge und kuratiere Filme & Serien auf iPhone, iPad, Desktop und Smart TV – powered by TMDB." />
 
     <!-- PWA / iOS Home Screen Capabilities -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -20,32 +20,14 @@
 
     <title>MovieJournal</title>
 
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..800;1,9..40,400..800&family=JetBrains+Mono:wght@400;600;700&family=Pacifico&family=Plus+Jakarta+Sans:wght@600;700;800&family=Yellowtail&display=swap" rel="stylesheet">
-    <script>
-      // Immediately unregister any stale Service Workers & Workbox caches that can cause a black screen
-      (function () {
-        try {
-          if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.getRegistrations().then(function (regs) {
-              for (var i = 0; i < regs.length; i++) {
-                regs[i].unregister();
-              }
-            }).catch(function () {});
-          }
-          if ('caches' in window) {
-            caches.keys().then(function (keys) {
-              for (var j = 0; j < keys.length; j++) {
-                caches.delete(keys[j]);
-              }
-            }).catch(function () {});
-          }
-        } catch (e) {}
-      })();
-    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..800;1,9..40,400..800&family=JetBrains+Mono:wght@500;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
+      rel="stylesheet"
+    />
   </head>
-  <body class="bg-black text-white select-none">
+  <body class="bg-black text-white">
     <div id="root"></div>
     <script type="module" src="/index.tsx"></script>
   </body>

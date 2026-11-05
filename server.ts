@@ -13,12 +13,6 @@ import {
   disableNetwork,
   doc,
   getDoc,
-  setDoc,
-  deleteDoc,
-  collection,
-  query,
-  where,
-  onSnapshot,
 } from 'firebase/firestore';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -54,6 +48,7 @@ const DISK_CACHE_FILE = path.join(CACHE_DIR, 'tmdb-regional-cache.json');
 const SECURITY_VAULT_FILE = path.join(CACHE_DIR, 'user-2fa-vault.json');
 const USER_SYNC_VAULT_FILE = path.join(CACHE_DIR, 'user-cloud-sync-vault.json');
 const QUOTA_GUARD_FILE = path.join(CACHE_DIR, 'daily-quota-guard.json');
+const VAULT_MASTER_KEY_FILE = path.join(CACHE_DIR, 'vault-master.key');
 const FIREBASE_CONFIG_FILE = path.join(__dirname, 'firebase-applet-config.json');
 const ADMIN_OWNER_EMAIL = 'infoc232@gmail.com';
 
@@ -216,12 +211,41 @@ function handleServerFirestoreQuotaError(err: unknown): void {
   }
 }
 
-// --- AES-256-GCM Server Cryptographic Vault ---
-const MASTER_VAULT_SECRET =
-  process.env.VAULT_SECRET ||
-  process.env.GEMINI_API_KEY ||
-  process.env.TMDB_API_KEY ||
-  `moviejournal-aes256-vault-${firebaseProjectId || 'acaa1505'}`;
+let firebaseDatabaseId = '(default)';
+try {
+  if (fs.existsSync(FIREBASE_CONFIG_FILE)) {
+    const cfg = JSON.parse(fs.readFileSync(FIREBASE_CONFIG_FILE, 'utf-8'));
+    if (cfg?.firestoreDatabaseId) {
+      firebaseDatabaseId = String(cfg.firestoreDatabaseId);
+    }
+  }
+} catch {
+  // ignore
+}
+
+// --- AES-256-GCM Server Cryptographic Vault (SEC-05: Dedicated Secret & Per-Record Random Salt) ---
+function loadOrCreateMasterVaultSecret(): string {
+  const envSecret = (process.env.VAULT_SECRET || '').trim();
+  if (envSecret.length >= 16) {
+    return envSecret;
+  }
+  try {
+    if (fs.existsSync(VAULT_MASTER_KEY_FILE)) {
+      const saved = fs.readFileSync(VAULT_MASTER_KEY_FILE, 'utf-8').trim();
+      if (saved.length >= 32) return saved;
+    }
+    const generated = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(VAULT_MASTER_KEY_FILE, generated, { encoding: 'utf-8', mode: 0o600 });
+    return generated;
+  } catch {
+    return crypto
+      .createHash('sha256')
+      .update(`moviejournal-dedicated-vault-secret-${firebaseProjectId || 'acaa1505'}`)
+      .digest('hex');
+  }
+}
+
+const MASTER_VAULT_SECRET = loadOrCreateMasterVaultSecret();
 
 const VAULT_CIPHER_KEY = crypto.scryptSync(
   MASTER_VAULT_SECRET,
@@ -230,16 +254,34 @@ const VAULT_CIPHER_KEY = crypto.scryptSync(
 );
 
 export function encryptForServerVault(plainText: string): string {
+  const recordSalt = crypto.randomBytes(16);
+  const derivedKey = crypto.scryptSync(MASTER_VAULT_SECRET, recordSalt, 32);
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', VAULT_CIPHER_KEY, iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', derivedKey, iv);
   const encrypted = Buffer.concat([cipher.update(plainText, 'utf8'), cipher.final()]);
   const authTag = cipher.getAuthTag();
-  return `${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
+  return `v2:${recordSalt.toString('hex')}:${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
 }
 
 export function decryptFromServerVault(cipherPayload: string): string | null {
   try {
-    const parts = (cipherPayload || '').split(':');
+    if (!cipherPayload || typeof cipherPayload !== 'string') return null;
+    if (cipherPayload.startsWith('v2:')) {
+      const parts = cipherPayload.split(':');
+      if (parts.length !== 5) return null;
+      const recordSalt = Buffer.from(parts[1], 'hex');
+      const iv = Buffer.from(parts[2], 'hex');
+      const authTag = Buffer.from(parts[3], 'hex');
+      const encrypted = Buffer.from(parts[4], 'hex');
+      const derivedKey = crypto.scryptSync(MASTER_VAULT_SECRET, recordSalt, 32);
+      const decipher = crypto.createDecipheriv('aes-256-gcm', derivedKey, iv);
+      decipher.setAuthTag(authTag);
+      const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+      return decrypted.toString('utf8');
+    }
+
+    // Legacy v1 compatibility (3-part payload)
+    const parts = cipherPayload.split(':');
     if (parts.length !== 3) return null;
     const iv = Buffer.from(parts[0], 'hex');
     const authTag = Buffer.from(parts[1], 'hex');
@@ -394,7 +436,7 @@ async function hydrateKeyPoolFromFirestoreVault(): Promise<void> {
   }
 }
 
-function persistVaultKeysToDiskAndFirestore(syncFirestore: boolean = false): void {
+function persistVaultKeysToDiskAndFirestore(_syncFirestore: boolean = false): void {
   const allVaultKeys = Array.from(tmdbKeyPool.values()).map((e) => e.rawKey);
   const encryptedPayload = encryptForServerVault(JSON.stringify(allVaultKeys));
   const now = Date.now();
@@ -411,15 +453,6 @@ function persistVaultKeysToDiskAndFirestore(syncFirestore: boolean = false): voi
     );
   } catch {
     // ignore
-  }
-
-  if (syncFirestore && firestoreDb && !serverFirestoreQuotaExhausted && allVaultKeys.length > 0) {
-    setDoc(doc(firestoreDb, 'serverKeyVault', 'tmdbPool'), {
-      vaultId: 'tmdbPool',
-      encryptedPayload,
-      keyCount: Math.min(25, allVaultKeys.length),
-      updatedAt: now,
-    }).catch(handleServerFirestoreQuotaError);
   }
 }
 
@@ -638,20 +671,13 @@ function scheduleDiskCachePersist() {
   if (persistTimeout) return;
   persistTimeout = setTimeout(() => {
     persistTimeout = null;
-    try {
-      const now = Date.now();
-      const validEntries = Array.from(l1RegionalCache.values())
-        .filter((e) => e.expiresAt + 24 * 60 * 60 * 1000 > now)
-        .slice(-1500);
-      const regionsList = Array.from(activeRegions.values());
-      fs.writeFileSync(
-        DISK_CACHE_FILE,
-        JSON.stringify({ entries: validEntries, regions: regionsList }),
-        'utf-8'
-      );
-    } catch {
-      // ignore
-    }
+    const now = Date.now();
+    const validEntries = Array.from(l1RegionalCache.values())
+      .filter((e) => e.expiresAt + 24 * 60 * 60 * 1000 > now)
+      .slice(-300);
+    const regionsList = Array.from(activeRegions.values());
+    const serialized = JSON.stringify({ entries: validEntries, regions: regionsList });
+    fs.promises.writeFile(DISK_CACHE_FILE, serialized, 'utf-8').catch(() => {});
   }, 5000);
   persistTimeout.unref?.();
 }
@@ -1333,19 +1359,111 @@ setInterval(() => {
   }
 }, 15 * 60 * 1000).unref();
 
-// --- Server-Side Firebase ID Token Verification & RFC 6238 TOTP Two-Factor Authentication ---
-interface VerifiedUserIdentity {
+// --- Server-Side Firebase ID Token Verification (SEC-01: Cryptographic RS256 + Fail-Closed) ---
+export interface VerifiedUserIdentity {
   uid: string;
   email: string;
   provider: string;
+  rawToken?: string;
 }
 
-async function verifyFirebaseIdToken(authHeader?: string): Promise<VerifiedUserIdentity | null> {
-  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
-  const idToken = authHeader.slice(7).trim();
-  if (!idToken || idToken.split('.').length !== 3) return null;
+let cachedGoogleCerts: Record<string, string> = {};
+let cachedGoogleCertsExpiresAt = 0;
 
-  // 1. Verify against Google Identity Toolkit accounts:lookup if Web API Key is available
+async function fetchGoogleSecureTokenCerts(): Promise<Record<string, string>> {
+  const now = Date.now();
+  if (now < cachedGoogleCertsExpiresAt && Object.keys(cachedGoogleCerts).length > 0) {
+    return cachedGoogleCerts;
+  }
+  try {
+    const res = await fetch(
+      'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com',
+      { signal: AbortSignal.timeout(4000) }
+    );
+    if (res.ok) {
+      const certs = (await res.json()) as Record<string, string>;
+      if (certs && typeof certs === 'object' && Object.keys(certs).length > 0) {
+        cachedGoogleCerts = certs;
+        cachedGoogleCertsExpiresAt = now + 60 * 60 * 1000; // 1 hour cache
+        return certs;
+      }
+    }
+  } catch {
+    // Return cached certs if still available; otherwise empty object (fail-closed)
+  }
+  return cachedGoogleCerts;
+}
+
+export async function verifyFirebaseIdToken(
+  authHeader?: string
+): Promise<VerifiedUserIdentity | null> {
+  if (!authHeader || typeof authHeader !== 'string' || !authHeader.startsWith('Bearer ')) {
+    return null;
+  }
+  const idToken = authHeader.slice(7).trim();
+  const segments = idToken.split('.');
+  if (!idToken || segments.length !== 3) return null;
+
+  const [headerB64, payloadB64, signatureB64] = segments;
+  if (!headerB64 || !payloadB64 || !signatureB64) return null;
+
+  let header: any = null;
+  let payload: any = null;
+  try {
+    header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8'));
+    payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+
+  // Strictly require RS256 and valid non-expired claims before any verification
+  const nowSec = Math.floor(Date.now() / 1000);
+  const expectedProject = firebaseProjectId || 'gen-lang-client-0463426822';
+  const expectedIssuer = `https://securetoken.google.com/${expectedProject}`;
+  const uid = String(payload?.user_id || payload?.sub || '').trim();
+
+  if (
+    !header ||
+    header.alg !== 'RS256' ||
+    typeof header.kid !== 'string' ||
+    !header.kid ||
+    !payload ||
+    !uid ||
+    typeof payload.exp !== 'number' ||
+    payload.exp <= nowSec ||
+    typeof payload.iat !== 'number' ||
+    payload.iat > nowSec + 300 ||
+    payload.aud !== expectedProject ||
+    payload.iss !== expectedIssuer
+  ) {
+    return null;
+  }
+
+  // 1. Cryptographic RS256 signature verification against Google's X.509 public certificates
+  try {
+    const certs = await fetchGoogleSecureTokenCerts();
+    const certPem = certs[header.kid];
+    if (certPem) {
+      const verifier = crypto.createVerify('RSA-SHA256');
+      verifier.update(`${headerB64}.${payloadB64}`);
+      verifier.end();
+      const sigBuf = Buffer.from(signatureB64, 'base64url');
+      if (verifier.verify(certPem, sigBuf)) {
+        return {
+          uid,
+          email: String(payload.email || ''),
+          provider: String(payload.firebase?.sign_in_provider || 'firebase'),
+          rawToken: idToken,
+        };
+      }
+      // If cert exists for kid and signature verification failed, immediately reject (forged signature)
+      return null;
+    }
+  } catch {
+    // Fall through to Google Identity Toolkit accounts:lookup verification
+  }
+
+  // 2. Cryptographic verification via Google Identity Toolkit accounts:lookup
   if (firebaseWebApiKey) {
     try {
       const lookupRes = await fetch(
@@ -1360,39 +1478,21 @@ async function verifyFirebaseIdToken(authHeader?: string): Promise<VerifiedUserI
       if (lookupRes.ok) {
         const lookupData = await lookupRes.json();
         const account = lookupData?.users?.[0];
-        if (account?.localId) {
+        if (account?.localId && String(account.localId) === uid) {
           return {
             uid: String(account.localId),
-            email: String(account.email || ''),
+            email: String(account.email || payload.email || ''),
             provider: String(account.providerUserInfo?.[0]?.providerId || 'firebase'),
+            rawToken: idToken,
           };
         }
       }
     } catch {
-      // Fallback to structural JWT claim verification if network is restricted
+      // Fail closed below
     }
   }
 
-  // 2. Fallback structural JWT verification
-  try {
-    const payloadB64 = idToken.split('.')[1];
-    const decoded = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
-    const nowSec = Math.floor(Date.now() / 1000);
-    if (
-      decoded &&
-      typeof decoded.user_id === 'string' &&
-      decoded.exp > nowSec - 60 &&
-      (!firebaseProjectId || decoded.aud === firebaseProjectId)
-    ) {
-      return {
-        uid: decoded.user_id,
-        email: String(decoded.email || ''),
-        provider: String(decoded.firebase?.sign_in_provider || 'firebase'),
-      };
-    }
-  } catch {
-    return null;
-  }
+  // SEC-01: Strictly fail closed. Never accept unverified JWT payloads.
   return null;
 }
 
@@ -1517,8 +1617,16 @@ export function verifyTwoFactorSessionTicket(uid: string, ticket?: string): bool
 }
 
 export function isAuthorizedAdminOwner(user: VerifiedUserIdentity | null): boolean {
-  if (!user || !user.email) return false;
-  return user.email.trim().toLowerCase() === ADMIN_OWNER_EMAIL;
+  if (!user || !user.uid) return false;
+  const configuredOwnerUid = (process.env.ADMIN_OWNER_UID || '').trim();
+  if (configuredOwnerUid) {
+    return user.uid === configuredOwnerUid;
+  }
+  const configuredOwnerEmail = (process.env.ADMIN_OWNER_EMAIL || ADMIN_OWNER_EMAIL)
+    .trim()
+    .toLowerCase();
+  if (!user.email) return false;
+  return user.email.trim().toLowerCase() === configuredOwnerEmail;
 }
 
 interface UserSecurityRecord {
@@ -1560,16 +1668,38 @@ function saveLocalUserSecurityCache(): void {
   }
 }
 
-async function getUserSecurityRecord(uid: string): Promise<UserSecurityRecord | null> {
+function getFirestoreDocumentRestUrl(collectionName: string, docId: string): string {
+  const proj = firebaseProjectId || 'gen-lang-client-0463426822';
+  return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(proj)}/databases/${encodeURIComponent(firebaseDatabaseId)}/documents/${encodeURIComponent(collectionName)}/${encodeURIComponent(docId)}`;
+}
+
+async function getUserSecurityRecord(
+  uid: string,
+  userRawToken?: string
+): Promise<UserSecurityRecord | null> {
   const cached = localUserSecurityCache.get(uid);
   if (cached) return cached;
-  if (firestoreDb && canUseServerFirestoreRead(1)) {
+  if (userRawToken && canUseServerFirestoreRead(1)) {
     try {
-      const snap = await getDoc(doc(firestoreDb, 'userSecurityVault', uid));
-      if (snap.exists()) {
-        const d = snap.data() as UserSecurityRecord;
-        localUserSecurityCache.set(uid, d);
-        return d;
+      const res = await fetch(getFirestoreDocumentRestUrl('userSecurityVault', uid), {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${userRawToken}` },
+        signal: AbortSignal.timeout(3500),
+      });
+      if (res.ok) {
+        const docJson = await res.json();
+        const f = docJson?.fields;
+        if (f) {
+          const record: UserSecurityRecord = {
+            uid: String(f.uid?.stringValue || uid),
+            twoFactorEnabled: Boolean(f.twoFactorEnabled?.booleanValue),
+            encryptedTotpSecret: String(f.encryptedTotpSecret?.stringValue || ''),
+            backupCodeHashesJson: String(f.backupCodeHashesJson?.stringValue || '[]'),
+            updatedAt: Number(f.updatedAt?.integerValue || f.updatedAt?.doubleValue || Date.now()),
+          };
+          localUserSecurityCache.set(uid, record);
+          return record;
+        }
       }
     } catch (err) {
       handleServerFirestoreQuotaError(err);
@@ -1578,12 +1708,31 @@ async function getUserSecurityRecord(uid: string): Promise<UserSecurityRecord | 
   return localUserSecurityCache.get(uid) || null;
 }
 
-async function saveUserSecurityRecord(record: UserSecurityRecord): Promise<void> {
+async function saveUserSecurityRecord(
+  record: UserSecurityRecord,
+  userRawToken?: string
+): Promise<void> {
   localUserSecurityCache.set(record.uid, record);
   saveLocalUserSecurityCache();
-  if (firestoreDb && canUseServerFirestoreWrite(1)) {
+  if (userRawToken && canUseServerFirestoreWrite(1)) {
     try {
-      await setDoc(doc(firestoreDb, 'userSecurityVault', record.uid), record);
+      await fetch(getFirestoreDocumentRestUrl('userSecurityVault', record.uid), {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${userRawToken}`,
+        },
+        body: JSON.stringify({
+          fields: {
+            uid: { stringValue: record.uid },
+            twoFactorEnabled: { booleanValue: Boolean(record.twoFactorEnabled) },
+            encryptedTotpSecret: { stringValue: record.encryptedTotpSecret || '' },
+            backupCodeHashesJson: { stringValue: record.backupCodeHashesJson || '[]' },
+            updatedAt: { integerValue: String(Math.floor(record.updatedAt || Date.now())) },
+          },
+        }),
+        signal: AbortSignal.timeout(3500),
+      });
     } catch (err) {
       handleServerFirestoreQuotaError(err);
     }
@@ -1606,157 +1755,52 @@ function getAiClient(): GoogleGenAI | null {
 export const ALLOWED_TMDB_ENDPOINT_REGEX =
   /^(authentication\/guest_session\/new|configuration|genre\/(movie|tv)\/list|watch\/providers\/(movie|tv)|movie\/(now_playing|upcoming|top_rated|\d+(\/[a-zA-Z0-9_]+)*)|tv\/(on_the_air|airing_today|top_rated|\d+(\/[a-zA-Z0-9_]+)*)|person\/\d+(\/[a-zA-Z0-9_]+)*|collection\/\d+(\/[a-zA-Z0-9_]+)*|company\/\d+(\/[a-zA-Z0-9_]+)*|keyword\/\d+|discover\/(movie|tv)|trending\/[a-zA-Z0-9_]+\/[a-zA-Z0-9_]+|search\/(multi|movie|tv|person|keyword))$/;
 
-/**
- * Real-Time Zero-Credential Firestore Proxy Bridge for Native iOS (capacitor://localhost).
- * Listens to /tmdbProxyQueue where status == 'pending', executes requests through the
- * Server Universal Cache & Multi-Key Rotation Pool, and writes responses back.
- */
-const activeProxyJobs = new Set<string>();
+// --- Explicit CORS Origin Allow-List (SEC-06) ---
+const ALLOWED_CORS_ORIGINS = new Set<string>([
+  'https://ais-dev-37sas3mekyso6nio5hh72d-849714710389.europe-west2.run.app',
+  'https://ais-pre-37sas3mekyso6nio5hh72d-849714710389.europe-west2.run.app',
+  'capacitor://localhost',
+  'ionic://localhost',
+]);
 
-function startFirestoreProxyBridge(): void {
-  if (!firestoreDb || serverFirestoreQuotaExhausted) return;
-
-  const pendingQuery = query(
-    collection(firestoreDb, 'tmdbProxyQueue'),
-    where('status', '==', 'pending')
-  );
-
-  onSnapshot(
-    pendingQuery,
-    (snapshot) => {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type !== 'added' && change.type !== 'modified') return;
-        const docSnap = change.doc;
-        const data = docSnap.data();
-        if (!data || data.status !== 'pending') return;
-
-        const requestId = docSnap.id;
-        if (activeProxyJobs.has(requestId)) return;
-        activeProxyJobs.add(requestId);
-
-        (async () => {
-          try {
-            const endpoint = String(data.endpoint || '').replace(/^\/+|\/+$/g, '');
-            const region =
-              String(data.region || 'DE')
-                .toUpperCase()
-                .replace(/[^A-Z]/g, '')
-                .slice(0, 5) || 'DE';
-            const language =
-              String(data.language || 'de-DE')
-                .replace(/[^a-zA-Z\-]/g, '')
-                .slice(0, 10) || 'de-DE';
-            const cacheKey = String(data.cacheKey || requestId).slice(0, 128);
-            const queryJsonStr = String(data.queryJson || '{}').slice(0, 1000);
-
-            if (
-              !endpoint ||
-              endpoint.includes('..') ||
-              endpoint.includes('\\') ||
-              !ALLOWED_TMDB_ENDPOINT_REGEX.test(endpoint)
-            ) {
-              if (canUseServerFirestoreWrite(1)) {
-                await setDoc(doc(firestoreDb!, 'tmdbProxyQueue', requestId), {
-                  requestId,
-                  cacheKey,
-                  endpoint: endpoint.slice(0, 200) || 'invalid',
-                  queryJson: queryJsonStr,
-                  region,
-                  language,
-                  status: 'error',
-                  statusCode: 400,
-                  responseJson: JSON.stringify({ status_message: 'Disallowed TMDB endpoint.' }),
-                  createdAt: Number(data.createdAt || Date.now()),
-                  updatedAt: Date.now(),
-                });
-              }
-              return;
-            }
-
-            let parsedQuery: Record<string, string> = {};
-            try {
-              const rawQ = JSON.parse(queryJsonStr);
-              if (rawQ && typeof rawQ === 'object') {
-                for (const [k, v] of Object.entries(rawQ)) {
-                  if (k === 'api_key') continue;
-                  if (v !== undefined && v !== null) {
-                    parsedQuery[k] = String(v).slice(0, 200);
-                  }
-                }
-              }
-            } catch {
-              parsedQuery = { language };
-            }
-
-            const regionLangId = `${region}_${language}`;
-            const existingReg = activeRegions.get(regionLangId);
-            if (!existingReg || Date.now() - existingReg.lastWarmedAt > 20 * 60 * 1000) {
-              warmRegionCatalogue(region, language).catch(() => {});
-            }
-
-            const result = await fetchTmdbThroughRegionalCache(endpoint, parsedQuery, region);
-            const compacted = compactTmdbPayloadForCache(result.data);
-            const responseJson = JSON.stringify(compacted);
-
-            if (canUseServerFirestoreWrite(1)) {
-              await setDoc(doc(firestoreDb!, 'tmdbProxyQueue', requestId), {
-                requestId,
-                cacheKey,
-                endpoint: endpoint.slice(0, 200),
-                queryJson: queryJsonStr,
-                region,
-                language,
-                status: result.status >= 200 && result.status < 300 ? 'completed' : 'error',
-                statusCode: result.status,
-                responseJson: responseJson.length <= 880000 ? responseJson : '{}',
-                createdAt: Number(data.createdAt || Date.now()),
-                updatedAt: Date.now(),
-              });
-            }
-          } catch (err: any) {
-            try {
-              if (canUseServerFirestoreWrite(1)) {
-                await setDoc(doc(firestoreDb!, 'tmdbProxyQueue', requestId), {
-                  requestId,
-                  cacheKey: String(data.cacheKey || requestId).slice(0, 128),
-                  endpoint: String(data.endpoint || 'error').slice(0, 200),
-                  queryJson: String(data.queryJson || '{}').slice(0, 1000),
-                  region: String(data.region || 'DE').slice(0, 5),
-                  language: String(data.language || 'de-DE').slice(0, 10),
-                  status: 'error',
-                  statusCode: 502,
-                  responseJson: JSON.stringify({
-                    status_message: err?.message || 'Upstream proxy error',
-                  }),
-                  createdAt: Number(data.createdAt || Date.now()),
-                  updatedAt: Date.now(),
-                });
-              }
-            } catch {
-              // ignore
-            }
-          } finally {
-            activeProxyJobs.delete(requestId);
-          }
-        })();
-      });
-    },
-    (err) => {
-      handleServerFirestoreQuotaError(err);
+export function isAllowedCorsOrigin(origin: string): boolean {
+  if (!origin || typeof origin !== 'string') return false;
+  const clean = origin.trim().replace(/\/+$/, '');
+  if (ALLOWED_CORS_ORIGINS.has(clean)) return true;
+  const customAllowed = (process.env.ALLOWED_ORIGIN || '').trim().replace(/\/+$/, '');
+  if (customAllowed && clean === customAllowed) return true;
+  if (process.env.NODE_ENV !== 'production') {
+    if (
+      clean === 'http://localhost' ||
+      clean === 'https://localhost' ||
+      /^https?:\/\/localhost:\d+$/.test(clean)
+    ) {
+      return true;
     }
-  );
+  }
+  return false;
 }
 
-// --- Tiered Anti-Bot & Anti-Brute-Force Rate Limiter ---
+// --- Tiered Anti-Bot & Anti-Brute-Force Rate Limiter (SEC-04: Bounded Memory & Trust Proxy) ---
 const rateLimitWindowMs = 60 * 1000;
+const MAX_RATE_BUCKETS = 5000;
 const ipTierBuckets = new Map<string, { count: number; resetAt: number }>();
 
-export function getRateLimitMaxForPath(reqPath: string): { tier: string; maxPerMinute: number } {
+export function getRateLimitMaxForPath(
+  reqPath: string,
+  method: string = 'GET'
+): { tier: string; maxPerMinute: number } {
   if (reqPath.startsWith('/api/auth/')) {
     return { tier: 'auth', maxPerMinute: 25 };
   }
   if (reqPath.startsWith('/api/ai/')) {
     return { tier: 'ai', maxPerMinute: 15 };
+  }
+  if (reqPath.startsWith('/api/client-error')) {
+    return { tier: 'client-error', maxPerMinute: 15 };
+  }
+  if (reqPath.startsWith('/api/tmdb') && method === 'POST') {
+    return { tier: 'tmdb-rate', maxPerMinute: 20 };
   }
   if (reqPath.startsWith('/api/user-sync/')) {
     return { tier: 'sync', maxPerMinute: 60 };
@@ -1770,12 +1814,18 @@ export function getRateLimitMaxForPath(reqPath: string): { tier: string; maxPerM
 export function checkTieredRateLimit(
   ip: string,
   reqPath: string,
-  nowMs: number = Date.now()
+  nowMs: number = Date.now(),
+  method: string = 'GET'
 ): { allowed: boolean; remaining: number; limit: number } {
-  const { tier, maxPerMinute } = getRateLimitMaxForPath(reqPath);
-  const bucketKey = `${ip}:${tier}`;
+  const { tier, maxPerMinute } = getRateLimitMaxForPath(reqPath, method);
+  const safeIp = String(ip || 'local').slice(0, 64);
+  const bucketKey = `${safeIp}:${tier}`;
   const bucket = ipTierBuckets.get(bucketKey);
   if (!bucket || nowMs > bucket.resetAt) {
+    if (!bucket && ipTierBuckets.size >= MAX_RATE_BUCKETS) {
+      const oldestKey = ipTierBuckets.keys().next().value;
+      if (oldestKey) ipTierBuckets.delete(oldestKey);
+    }
     ipTierBuckets.set(bucketKey, { count: 1, resetAt: nowMs + rateLimitWindowMs });
     return { allowed: true, remaining: maxPerMinute - 1, limit: maxPerMinute };
   }
@@ -1799,26 +1849,26 @@ setInterval(() => {
 async function startServer() {
   const app = express();
   app.disable('x-powered-by');
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '256kb' }));
 
-  // --- Hardened Security Headers, Native iOS Capacitor CORS & Tiered Rate Limiter ---
+  // --- Hardened Security Headers, Explicit CORS Allow-List & Tiered Rate Limiter ---
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'SAMEORIGIN');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    res.setHeader(
+      'Content-Security-Policy',
+      "default-src 'self' https: data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://accounts.google.com https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' https: data: blob:; connect-src 'self' https: wss:; frame-src 'self' https://www.youtube.com https://www.youtube-nocookie.com https://accounts.google.com https://*.firebaseapp.com; frame-ancestors 'self' https://*.google.com https://*.run.app;"
+    );
 
     if (req.path.startsWith('/api/')) {
       const origin = String(req.headers.origin || '');
-      if (
-        origin.startsWith('capacitor://') ||
-        origin.startsWith('ionic://') ||
-        origin.startsWith('http://localhost') ||
-        origin.startsWith('https://localhost') ||
-        origin.endsWith('.run.app')
-      ) {
+      if (isAllowedCorsOrigin(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
         res.setHeader(
           'Access-Control-Allow-Headers',
@@ -1830,10 +1880,8 @@ async function startServer() {
         return;
       }
 
-      const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'local')
-        .split(',')[0]
-        .trim();
-      const rateCheck = checkTieredRateLimit(ip, req.path);
+      const clientIp = String(req.ip || req.socket.remoteAddress || 'local').trim();
+      const rateCheck = checkTieredRateLimit(clientIp, req.path, Date.now(), req.method);
       res.setHeader('X-RateLimit-Limit', String(rateCheck.limit));
       res.setHeader('X-RateLimit-Remaining', String(rateCheck.remaining));
       if (!rateCheck.allowed) {
@@ -1878,7 +1926,7 @@ async function startServer() {
       return;
     }
 
-    const record = await getUserSecurityRecord(user.uid);
+    const record = await getUserSecurityRecord(user.uid, user.rawToken);
     const enabled = Boolean(record?.twoFactorEnabled && record?.encryptedTotpSecret);
     const ticket = String(req.body?.twoFactorTicket || req.headers['x-2fa-ticket'] || '');
     const sessionVerified = !enabled || verifyTwoFactorSessionTicket(user.uid, ticket);
@@ -1967,13 +2015,16 @@ async function startServer() {
     const encryptedTotpSecret = encryptForServerVault(pending.secret);
     const hashes = pending.backupCodes.map((c) => hashBackupCode(user.uid, c));
 
-    await saveUserSecurityRecord({
-      uid: user.uid,
-      twoFactorEnabled: true,
-      encryptedTotpSecret,
-      backupCodeHashesJson: JSON.stringify(hashes),
-      updatedAt: Date.now(),
-    });
+    await saveUserSecurityRecord(
+      {
+        uid: user.uid,
+        twoFactorEnabled: true,
+        encryptedTotpSecret,
+        backupCodeHashesJson: JSON.stringify(hashes),
+        updatedAt: Date.now(),
+      },
+      user.rawToken
+    );
 
     pendingTotpSetups.delete(user.uid);
     const twoFactorTicket = signTwoFactorSessionTicket(user.uid);
@@ -1994,7 +2045,7 @@ async function startServer() {
     }
 
     const rawCode = String(req.body?.code || '').trim();
-    const record = await getUserSecurityRecord(user.uid);
+    const record = await getUserSecurityRecord(user.uid, user.rawToken);
     if (!record || !record.twoFactorEnabled || !record.encryptedTotpSecret) {
       const ticket = signTwoFactorSessionTicket(user.uid);
       res.json({ ok: true, twoFactorTicket: ticket });
@@ -2026,11 +2077,14 @@ async function startServer() {
     const matchIdx = hashes.indexOf(candidateHash);
     if (matchIdx !== -1) {
       hashes.splice(matchIdx, 1);
-      await saveUserSecurityRecord({
-        ...record,
-        backupCodeHashesJson: JSON.stringify(hashes),
-        updatedAt: Date.now(),
-      });
+      await saveUserSecurityRecord(
+        {
+          ...record,
+          backupCodeHashesJson: JSON.stringify(hashes),
+          updatedAt: Date.now(),
+        },
+        user.rawToken
+      );
       const twoFactorTicket = signTwoFactorSessionTicket(user.uid);
       res.json({
         ok: true,
@@ -2052,13 +2106,16 @@ async function startServer() {
       return;
     }
 
-    await saveUserSecurityRecord({
-      uid: user.uid,
-      twoFactorEnabled: false,
-      encryptedTotpSecret: '',
-      backupCodeHashesJson: '[]',
-      updatedAt: Date.now(),
-    });
+    await saveUserSecurityRecord(
+      {
+        uid: user.uid,
+        twoFactorEnabled: false,
+        encryptedTotpSecret: '',
+        backupCodeHashesJson: '[]',
+        updatedAt: Date.now(),
+      },
+      user.rawToken
+    );
 
     res.json({ ok: true, twoFactorEnabled: false });
   });
@@ -2313,35 +2370,10 @@ async function startServer() {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
-    let existing = serverUserSyncVault.get(user.uid) || {
+    const existing = serverUserSyncVault.get(user.uid) || {
       uid: user.uid,
       updatedAt: 0,
     };
-
-    // Bridge with shared Firestore userLibraryVault so Preview (ais-dev) & Shared (ais-pre) containers stay 100% in sync
-    if (firestoreDb && !serverFirestoreQuotaExhausted && canUseServerFirestoreRead(1)) {
-      try {
-        const snap = await getDoc(doc(firestoreDb, 'userLibraryVault', user.uid));
-        if (snap.exists()) {
-          const data = snap.data();
-          if (data?.libraryJson && typeof data.libraryJson === 'string') {
-            const parsedVaultLib = JSON.parse(data.libraryJson);
-            const mergedLib = mergeUserSyncLibraryState(existing.library || {}, parsedVaultLib);
-            existing = {
-              ...existing,
-              library: mergedLib,
-              updatedAt: Math.max(
-                existing.updatedAt || 0,
-                Number(data.updatedAtMs || data.updatedAt) || Date.now()
-              ),
-            };
-            serverUserSyncVault.set(user.uid, existing);
-          }
-        }
-      } catch (e) {
-        handleServerFirestoreQuotaError(e);
-      }
-    }
 
     res.setHeader('Cache-Control', 'no-store');
     res.json(existing);
@@ -2377,20 +2409,6 @@ async function startServer() {
     serverUserSyncVault.set(user.uid, updated);
     persistServerUserSyncVault();
 
-    // Mirror merged vault to shared Firestore userLibraryVault (1 atomic doc write)
-    if (firestoreDb && !serverFirestoreQuotaExhausted && canUseServerFirestoreWrite(1)) {
-      const serialized = JSON.stringify(nextLibrary);
-      if (Buffer.byteLength(serialized, 'utf-8') <= 780_000) {
-        const wlCount = Array.isArray(nextLibrary.watchlist) ? nextLibrary.watchlist.length : 0;
-        setDoc(doc(firestoreDb, 'userLibraryVault', user.uid), {
-          uid: user.uid,
-          libraryJson: serialized,
-          itemCount: Math.min(5000, wlCount),
-          updatedAtMs: updated.updatedAt,
-        }).catch((e) => handleServerFirestoreQuotaError(e));
-      }
-    }
-
     res.json({ ok: true, updatedAt: updated.updatedAt, library: nextLibrary });
   });
 
@@ -2405,10 +2423,18 @@ async function startServer() {
     localUserSecurityCache.delete(user.uid);
     saveLocalUserSecurityCache();
 
-    if (firestoreDb && !serverFirestoreQuotaExhausted) {
+    if (user.rawToken) {
       await Promise.allSettled([
-        deleteDoc(doc(firestoreDb, 'userLibraryVault', user.uid)),
-        deleteDoc(doc(firestoreDb, 'userSecurityVault', user.uid)),
+        fetch(getFirestoreDocumentRestUrl('userLibraryVault', user.uid), {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${user.rawToken}` },
+          signal: AbortSignal.timeout(3500),
+        }),
+        fetch(getFirestoreDocumentRestUrl('userSecurityVault', user.uid), {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${user.rawToken}` },
+          signal: AbortSignal.timeout(3500),
+        }),
       ]);
     }
     res.json({ ok: true });
@@ -2730,10 +2756,20 @@ async function startServer() {
         .replace(/[^A-Z]/g, '')
         .slice(0, 5) || 'DE';
 
-    // Non-GET requests (only rating a movie/tv show is permitted)
+    // Non-GET requests (SEC-07: Only authenticated & validated rating POST is permitted)
     if (req.method !== 'GET') {
       if (req.method !== 'POST' || !/^(movie|tv)\/\d+\/rating$/.test(endpoint)) {
         res.status(405).json({ status_message: 'Method not allowed on this endpoint.' });
+        return;
+      }
+      const verifiedUser = await verifyFirebaseIdToken(req.headers.authorization);
+      if (!verifiedUser) {
+        res.status(401).json({ status_message: 'Authentication required to submit ratings.' });
+        return;
+      }
+      const ratingVal = Number(req.body?.value);
+      if (!Number.isFinite(ratingVal) || ratingVal < 0.5 || ratingVal > 10) {
+        res.status(400).json({ status_message: 'Rating value must be between 0.5 and 10.0.' });
         return;
       }
       try {
@@ -2746,7 +2782,7 @@ async function startServer() {
           endpoint,
           queryRecord,
           'POST',
-          req.body ? JSON.stringify(req.body) : undefined
+          JSON.stringify({ value: Math.round(ratingVal * 2) / 2 })
         );
         res.status(rotated.status).json(rotated.data);
       } catch (error: any) {
@@ -2930,32 +2966,147 @@ async function startServer() {
     }
   });
 
-  // Client runtime error telemetry endpoint for remote debugging Smart TVs
+  // Client runtime error telemetry endpoint (SEC-04: Sanitized & bounded log entry)
   app.post('/api/client-error', (req, res) => {
-    console.error('[CLIENT-RUNTIME-ERROR]', JSON.stringify(req.body || {}));
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    logStructured('ERROR', 'Client runtime error reported', {
+      clientMessage: String(body.message || body.error || 'Unknown error').slice(0, 300),
+      clientUrl: String(body.url || '').slice(0, 200),
+      clientStack: String(body.stack || '').slice(0, 500),
+    });
     res.json({ ok: true });
   });
 
-  // Self-healing Service Worker endpoint to purge any stale PWA cache on TV / Browser without forced reloads
-  const sendSelfUnregisteringSw = (_req: express.Request, res: express.Response) => {
+  // Production Offline-Capable Stale-While-Revalidate Service Worker (App-Shell + TMDB Poster Cache)
+  const sendProductionServiceWorker = (_req: express.Request, res: express.Response) => {
     res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
     res.send(`
-      self.addEventListener('install', () => self.skipWaiting());
+      const CACHE_SHELL = 'mj-shell-v3';
+      const CACHE_IMAGES = 'mj-posters-v3';
+      const CACHE_API = 'mj-api-v3';
+      const PRECACHE_ASSETS = [
+        '/manifest.json',
+        '/icon.svg',
+        '/apple-touch-icon.png',
+        '/pwa-192x192.png',
+        '/pwa-512x512.png',
+        '/pwa-maskable-512x512.png'
+      ];
+
+      self.addEventListener('install', (event) => {
+        self.skipWaiting();
+        event.waitUntil(
+          caches.open(CACHE_SHELL).then((cache) => cache.addAll(PRECACHE_ASSETS).catch(() => {}))
+        );
+      });
+
       self.addEventListener('activate', (event) => {
         event.waitUntil(
-          caches.keys().then((keys) => Promise.all(keys.map((k) => caches.delete(k))))
-            .then(() => self.registration.unregister())
+          caches.keys().then((keys) =>
+            Promise.all(
+              keys
+                .filter((k) => k !== CACHE_SHELL && k !== CACHE_IMAGES && k !== CACHE_API)
+                .map((k) => caches.delete(k))
+            )
+          ).then(() => self.clients.claim())
         );
+      });
+
+      self.addEventListener('fetch', (event) => {
+        const req = event.request;
+        if (req.method !== 'GET') return;
+        const url = new URL(req.url);
+
+        // Never intercept Vite dev transforms or auth/sync mutations
+        if (
+          url.pathname.startsWith('/@') ||
+          url.pathname.startsWith('/node_modules/') ||
+          url.pathname.endsWith('.tsx') ||
+          url.pathname.endsWith('.ts') ||
+          url.pathname.startsWith('/api/auth/') ||
+          url.pathname.startsWith('/api/user-sync/') ||
+          url.pathname.startsWith('/api/admin/')
+        ) {
+          return;
+        }
+
+        // 1. TMDB Posters & Backdrops: Cache-First with background refresh
+        if (url.hostname === 'image.tmdb.org') {
+          event.respondWith(
+            caches.open(CACHE_IMAGES).then(async (cache) => {
+              const cached = await cache.match(req);
+              const fetchPromise = fetch(req)
+                .then((netRes) => {
+                  if (netRes && netRes.ok) {
+                    cache.put(req, netRes.clone()).catch(() => {});
+                  }
+                  return netRes;
+                })
+                .catch(() => cached);
+              return cached || fetchPromise;
+            })
+          );
+          return;
+        }
+
+        // 2. TMDB Proxy GET API: Network-First with offline cache fallback
+        if (url.pathname.startsWith('/api/tmdb/')) {
+          event.respondWith(
+            caches.open(CACHE_API).then(async (cache) => {
+              try {
+                const netRes = await fetch(req);
+                if (netRes && netRes.ok) {
+                  cache.put(req, netRes.clone()).catch(() => {});
+                }
+                return netRes;
+              } catch (err) {
+                const cached = await cache.match(req);
+                if (cached) return cached;
+                throw err;
+              }
+            })
+          );
+          return;
+        }
+
+        // 3. HTML Navigation & Static Assets: Network-First with offline shell fallback
+        if (req.mode === 'navigate' || url.origin === self.location.origin) {
+          event.respondWith(
+            caches.open(CACHE_SHELL).then(async (cache) => {
+              try {
+                const netRes = await fetch(req);
+                if (netRes && netRes.ok && url.origin === self.location.origin) {
+                  cache.put(req, netRes.clone()).catch(() => {});
+                }
+                return netRes;
+              } catch (err) {
+                const cached = await cache.match(req);
+                if (cached) return cached;
+                if (req.mode === 'navigate') {
+                  const rootCached = await cache.match('/');
+                  if (rootCached) return rootCached;
+                }
+                throw err;
+              }
+            })
+          );
+        }
       });
     `);
   };
-  app.get('/sw.js', sendSelfUnregisteringSw);
-  app.get('/dev-sw.js', sendSelfUnregisteringSw);
+  app.get('/sw.js', sendProductionServiceWorker);
+  app.get('/dev-sw.js', sendProductionServiceWorker);
   app.get('/registerSW.js', (_req, res) => {
     res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
-    res.send('// SW disabled');
+    res.send(`
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js').catch(() => {});
+        });
+      }
+    `);
   });
 
   // --- Vite Middleware (Development) or Static Assets (Production) ---
@@ -2991,7 +3142,6 @@ async function startServer() {
       env: process.env.NODE_ENV || 'development',
     });
     hydrateKeyPoolFromFirestoreVault().then(() => {
-      startFirestoreProxyBridge();
       warmRegionCatalogue('DE', 'de-DE').catch(() => {});
     });
   });
@@ -3021,6 +3171,7 @@ export interface SyncUserLibraryState {
   manuallyWatchedShows?: number[];
   removedShows?: Record<string, number>;
   watchedEpisodes?: Record<string, number[]>;
+  removedEpisodes?: Record<string, number>;
   updatedAt?: string;
   replaceAll?: boolean;
 }
@@ -3053,6 +3204,7 @@ export function mergeUserSyncLibraryState(
         incomingLib.watchedEpisodes && typeof incomingLib.watchedEpisodes === 'object'
           ? incomingLib.watchedEpisodes
           : {},
+      removedEpisodes: incomingLib.removedEpisodes || {},
       updatedAt: new Date().toISOString(),
     };
   }
@@ -3075,6 +3227,10 @@ export function mergeUserSyncLibraryState(
   const mergedRemovedShows: Record<string, number> = {
     ...(currentLib.removedShows || {}),
     ...(incomingLib.removedShows || {}),
+  };
+  const mergedRemovedEpisodes: Record<string, number> = {
+    ...(currentLib.removedEpisodes || {}),
+    ...(incomingLib.removedEpisodes || {}),
   };
 
   // Union watchlist items while respecting explicit removals
@@ -3116,22 +3272,40 @@ export function mergeUserSyncLibraryState(
     if (Number(remTs) > 0) showSet.delete(Number(sKey));
   }
 
-  // Union watchedEpisodes per show across devices
+  // Union watchedEpisodes per show across devices while respecting episode tombstones
   const mergedEpisodes: Record<string, number[]> = {};
   for (const [seriesId, eps] of Object.entries(currentLib.watchedEpisodes || {})) {
     if (Array.isArray(eps)) {
-      mergedEpisodes[seriesId] = Array.from(
-        new Set(eps.map(Number).filter((n) => Number.isFinite(n) && n > 0))
+      const filtered = Array.from(
+        new Set(
+          eps
+            .map(Number)
+            .filter(
+              (n) => Number.isFinite(n) && n > 0 && !mergedRemovedEpisodes[`${seriesId}:${n}`]
+            )
+        )
       );
+      if (filtered.length > 0) {
+        mergedEpisodes[seriesId] = filtered;
+      }
     }
   }
   if (incomingLib.watchedEpisodes && typeof incomingLib.watchedEpisodes === 'object') {
     for (const [seriesId, eps] of Object.entries(incomingLib.watchedEpisodes)) {
       if (Array.isArray(eps)) {
         const existingEps = mergedEpisodes[seriesId] || [];
-        mergedEpisodes[seriesId] = Array.from(
-          new Set([...existingEps, ...eps.map(Number).filter((n) => Number.isFinite(n) && n > 0)])
+        const combined = Array.from(
+          new Set(
+            [...existingEps, ...eps.map(Number).filter((n) => Number.isFinite(n) && n > 0)].filter(
+              (n) => !mergedRemovedEpisodes[`${seriesId}:${n}`]
+            )
+          )
         );
+        if (combined.length > 0) {
+          mergedEpisodes[seriesId] = combined;
+        } else {
+          delete mergedEpisodes[seriesId];
+        }
       }
     }
   }
@@ -3144,6 +3318,7 @@ export function mergeUserSyncLibraryState(
     manuallyWatchedShows: Array.from(showSet).slice(0, 500),
     removedShows: mergedRemovedShows,
     watchedEpisodes: mergedEpisodes,
+    removedEpisodes: mergedRemovedEpisodes,
     updatedAt: new Date().toISOString(),
   };
 }

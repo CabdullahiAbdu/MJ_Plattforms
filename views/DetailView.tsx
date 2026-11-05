@@ -198,6 +198,12 @@ export const DetailView: React.FC<DetailViewProps> = ({
   const [keywordItems, setKeywordItems] = useState<MediaItem[]>([]);
   const [loadingKeyword, setLoadingKeyword] = useState(false);
 
+  // Zero-CLS Season Episode Cache & Loading State
+  const [loadingSeasonNumber, setLoadingSeasonNumber] = useState<number | null>(null);
+  const seasonCacheRef = useRef<
+    Map<number, { seasonDetails: any; seasonProviders: WatchProviderCountryData | null }>
+  >(new Map());
+
   // Feature #2: Interactive iOS Left-Edge Swipe-Back & Top Pull-to-Dismiss
   const rootRef = useRef<HTMLDivElement>(null);
   const gestureRef = useRef<{
@@ -356,6 +362,13 @@ export const DetailView: React.FC<DetailViewProps> = ({
         }
       }
 
+      if (data.selectedSeasonNumber !== undefined && data.seasonDetails) {
+        seasonCacheRef.current.set(data.selectedSeasonNumber, {
+          seasonDetails: data.seasonDetails,
+          seasonProviders: data.seasonProviders ?? null,
+        });
+      }
+
       setDetailState({
         item: data.item,
         credits: data.credits || null,
@@ -394,9 +407,17 @@ export const DetailView: React.FC<DetailViewProps> = ({
     setRecTab('recommendations');
     setActiveKeyword(null);
     setLightboxIndex(null);
+    setLoadingSeasonNumber(null);
+    seasonCacheRef.current.clear();
 
     const cached = tmdb.peekAggregateDetails(id, type, view);
     if (cached && !kinoCheckKey) {
+      if (cached.selectedSeasonNumber !== undefined && cached.seasonDetails) {
+        seasonCacheRef.current.set(cached.selectedSeasonNumber, {
+          seasonDetails: cached.seasonDetails,
+          seasonProviders: cached.seasonProviders ?? null,
+        });
+      }
       setDetailState({
         item: cached.item,
         credits: cached.credits || null,
@@ -518,16 +539,34 @@ export const DetailView: React.FC<DetailViewProps> = ({
     if (onBack) onBack();
   };
 
-  // Endpoint #2: Fetch season episodes AND season-specific watch providers simultaneously
+  // Endpoint #2: Fetch season episodes AND season-specific watch providers simultaneously with 0ms in-memory cache & Zero-CLS skeletons
   const changeSeason = async (seasonNum: number) => {
     if (!detailState.item) return;
     haptics.selection();
+
+    const cachedSeason = seasonCacheRef.current.get(seasonNum);
+    if (cachedSeason) {
+      setLoadingSeasonNumber(null);
+      setDetailState((prev) => ({
+        ...prev,
+        selectedSeasonNumber: seasonNum,
+        seasonDetails: cachedSeason.seasonDetails,
+        seasonProviders: cachedSeason.seasonProviders,
+      }));
+      return;
+    }
+
+    setLoadingSeasonNumber(seasonNum);
     setDetailState((prev) => ({ ...prev, selectedSeasonNumber: seasonNum }));
     try {
       const [seasonData, seasonProv] = await Promise.all([
         tmdb.getSeasonDetails(detailState.item.id, seasonNum),
         tmdb.getSeasonWatchProviders(detailState.item.id, seasonNum).catch(() => null),
       ]);
+      seasonCacheRef.current.set(seasonNum, {
+        seasonDetails: seasonData,
+        seasonProviders: seasonProv,
+      });
       setDetailState((prev) => ({
         ...prev,
         seasonDetails: seasonData,
@@ -536,6 +575,8 @@ export const DetailView: React.FC<DetailViewProps> = ({
       }));
     } catch (e) {
       console.error(e);
+    } finally {
+      setLoadingSeasonNumber((curr) => (curr === seasonNum ? null : curr));
     }
   };
 
@@ -615,9 +656,11 @@ export const DetailView: React.FC<DetailViewProps> = ({
   if (detailState.error && !detailState.item) {
     return (
       <div className="flex flex-col items-center justify-center h-screen bg-black text-white p-6 text-center space-y-4">
-        <h2 className="text-[length:var(--fluid-h2)] font-bold">Could not load details</h2>
+        <h2 className="text-[length:var(--fluid-h2)] font-bold">
+          Details konnten nicht geladen werden
+        </h2>
         <p className="text-[length:var(--fluid-body)] text-zinc-400 max-w-md">
-          The requested title could not be retrieved from TMDB right now.
+          Der angeforderte Titel konnte aktuell nicht von TMDB abgerufen werden.
         </p>
         <div className="flex gap-3">
           {onBack && (
@@ -626,7 +669,7 @@ export const DetailView: React.FC<DetailViewProps> = ({
               onClick={handleBackClick}
               className="px-6 py-3 rounded-xl bg-white/10 hover:bg-white/20 text-white font-bold text-sm"
             >
-              Go Back
+              Zurück
             </button>
           )}
           <button
@@ -634,7 +677,7 @@ export const DetailView: React.FC<DetailViewProps> = ({
             onClick={loadDetails}
             className="px-6 py-3 rounded-xl bg-white text-black font-bold text-sm flex items-center gap-2"
           >
-            <RefreshCw size={16} /> Retry
+            <RefreshCw size={16} /> Erneut versuchen
           </button>
         </div>
       </div>
@@ -811,7 +854,7 @@ export const DetailView: React.FC<DetailViewProps> = ({
               onClick={handleStopTrailer}
               className="bg-black/70 backdrop-blur-xl px-4 py-2 rounded-full text-white hover:bg-white hover:text-black font-bold text-xs sm:text-sm transition-all border border-white/15 flex items-center gap-2 shadow-2xl"
             >
-              <X size={15} /> Stop Trailer
+              <X size={15} /> Trailer beenden
             </button>
           )}
 
@@ -919,7 +962,7 @@ export const DetailView: React.FC<DetailViewProps> = ({
 
               {/* Metadata Line (Frameless Apple TV+ Editorial Row) */}
               <div className="flex flex-wrap items-center justify-center md:justify-start gap-2 text-[clamp(0.75rem,2.1vw,0.875rem)] font-semibold text-zinc-300 tabular-nums">
-                {isCollection && <span className="text-indigo-400">Film Collection</span>}
+                {isCollection && <span className="text-indigo-400">Filmreihe</span>}
                 {i.vote_average > 0 && (
                   <>
                     {isCollection && <span aria-hidden="true">·</span>}
@@ -1003,7 +1046,7 @@ export const DetailView: React.FC<DetailViewProps> = ({
                     className="group bg-white text-black rounded-xl font-bold transition-all active:scale-95 flex items-center gap-2 shadow-xl whitespace-nowrap shrink-0"
                   >
                     <Play size={16} fill="currentColor" />
-                    <span>Play Trailer</span>
+                    <span>Trailer abspielen</span>
                   </button>
                 )}
 
@@ -1027,10 +1070,10 @@ export const DetailView: React.FC<DetailViewProps> = ({
                     <ExternalLink size={16} />
                     <span>
                       {primaryMatchedProvider
-                        ? `Stream in ${primaryMatchedProvider.provider_name}`
+                        ? `Streamen bei ${primaryMatchedProvider.provider_name}`
                         : otherFlatrateProviders[0]
-                        ? `Stream on ${otherFlatrateProviders[0].provider_name}`
-                        : 'Watch Options'}
+                        ? `Streamen bei ${otherFlatrateProviders[0].provider_name}`
+                        : 'Streaming-Optionen'}
                     </span>
                   </a>
                 )}
@@ -1452,68 +1495,112 @@ export const DetailView: React.FC<DetailViewProps> = ({
                   </div>
                 )}
 
-                {seasonDetails && seasonDetails.episodes && (
-                  <div className="divide-y divide-white/[0.08]">
-                    {seasonDetails.episodes.map((ep: any) => {
-                      const isWatched = watchedEpisodes.includes(ep.id);
-                      return (
+                {loadingSeasonNumber !== null || (detailState.loading && !seasonDetails) ? (
+                  <div
+                    aria-busy="true"
+                    aria-label="Episoden werden geladen"
+                    className="divide-y divide-white/[0.08]"
+                  >
+                    {Array.from({
+                      length: Math.min(
+                        8,
+                        Math.max(
+                          4,
+                          (i as TvShowDetails).seasons?.find(
+                            (s) => s.season_number === (loadingSeasonNumber ?? selectedSeasonNumber)
+                          )?.episode_count || 6
+                        )
+                      ),
+                    }).map((_, idx) => (
+                      <div
+                        key={`ep-skeleton-${idx}`}
+                        className="flex gap-4 py-4 first:pt-1 last:pb-1 min-h-[108px] items-center"
+                      >
                         <div
-                          key={ep.id}
-                          onClick={() => {
-                            haptics.light();
-                            onToggleEpisode(ep.id);
-                          }}
-                          className="flex gap-4 py-4 first:pt-1 last:pb-1 group cursor-pointer transition-opacity active:opacity-80"
+                          style={{ width: 'clamp(112px, 30vw, 168px)' }}
+                          className="aspect-video rounded-xl cinema-shimmer flex-shrink-0 relative overflow-hidden shadow-md"
                         >
-                          <div
-                            style={{ width: 'clamp(112px, 30vw, 168px)' }}
-                            className="aspect-video bg-zinc-900 rounded-xl overflow-hidden flex-shrink-0 relative shadow-md"
-                          >
-                            <SafeImage
-                              src={tmdb.getImageUrl(ep.still_path, 'w300')}
-                              fallbackTitle={`Folge ${ep.episode_number}`}
-                              mediaType="tv"
-                              className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                            />
-                            <div
-                              className={`absolute top-2 right-2 w-6 h-6 rounded-full flex items-center justify-center transition-all ${
-                                isWatched
-                                  ? 'bg-emerald-500 text-black shadow-md'
-                                  : 'bg-black/60 text-white/70 border border-white/20 opacity-0 group-hover:opacity-100'
-                              }`}
-                            >
-                              <Check size={13} strokeWidth={3.5} />
-                            </div>
+                          <div className="absolute top-2 right-2 w-6 h-6 rounded-full bg-white/[0.08]" />
+                        </div>
+                        <div className="flex-1 min-w-0 flex flex-col justify-center space-y-2">
+                          <div className="flex items-center gap-2">
+                            <div className="h-3 w-14 rounded-md cinema-shimmer" />
+                            <div className="h-3 w-12 rounded-md cinema-shimmer" />
                           </div>
-                          <div className="flex-1 min-w-0 flex flex-col justify-center">
-                            <div className="flex items-center gap-2 mb-0.5 tabular-nums text-xs text-zinc-400 font-semibold">
-                              <span className="text-zinc-200 font-bold">
-                                Folge {ep.episode_number}
-                              </span>
-                              {ep.runtime && (
-                                <>
-                                  <span aria-hidden="true">·</span>
-                                  <span>{ep.runtime} Min.</span>
-                                </>
-                              )}
-                              {ep.air_date && (
-                                <>
-                                  <span aria-hidden="true">·</span>
-                                  <span>{ep.air_date.substring(0, 4)}</span>
-                                </>
-                              )}
-                            </div>
-                            <h4 className="text-[clamp(0.85rem,2.3vw,1rem)] font-bold text-white leading-snug mb-1 group-hover:text-zinc-200 transition-colors line-clamp-1">
-                              {ep.name}
-                            </h4>
-                            <p className="text-[clamp(0.75rem,1.9vw,0.85rem)] text-zinc-400 line-clamp-2 leading-relaxed">
-                              {ep.overview}
-                            </p>
+                          <div className="h-4 w-3/5 rounded-lg cinema-shimmer" />
+                          <div className="space-y-1.5 pt-0.5">
+                            <div className="h-3 w-full rounded-md cinema-shimmer" />
+                            <div className="h-3 w-4/5 rounded-md cinema-shimmer" />
                           </div>
                         </div>
-                      );
-                    })}
+                      </div>
+                    ))}
                   </div>
+                ) : (
+                  seasonDetails &&
+                  seasonDetails.episodes && (
+                    <div className="divide-y divide-white/[0.08] animate-fade-in">
+                      {seasonDetails.episodes.map((ep: any) => {
+                        const isWatched = watchedEpisodes.includes(ep.id);
+                        return (
+                          <div
+                            key={ep.id}
+                            onClick={() => {
+                              haptics.light();
+                              onToggleEpisode(ep.id);
+                            }}
+                            className="flex gap-4 py-4 first:pt-1 last:pb-1 min-h-[108px] group cursor-pointer transition-opacity active:opacity-80"
+                          >
+                            <div
+                              style={{ width: 'clamp(112px, 30vw, 168px)' }}
+                              className="aspect-video bg-zinc-900 rounded-xl overflow-hidden flex-shrink-0 relative shadow-md"
+                            >
+                              <SafeImage
+                                src={tmdb.getImageUrl(ep.still_path, 'w300')}
+                                fallbackTitle={`Folge ${ep.episode_number}`}
+                                mediaType="tv"
+                                className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                              />
+                              <div
+                                className={`absolute top-2 right-2 w-6 h-6 rounded-full flex items-center justify-center transition-all ${
+                                  isWatched
+                                    ? 'bg-emerald-500 text-black shadow-md'
+                                    : 'bg-black/60 text-white/70 border border-white/20 opacity-0 group-hover:opacity-100'
+                                }`}
+                              >
+                                <Check size={13} strokeWidth={3.5} />
+                              </div>
+                            </div>
+                            <div className="flex-1 min-w-0 flex flex-col justify-center">
+                              <div className="flex items-center gap-2 mb-0.5 tabular-nums text-xs text-zinc-400 font-semibold">
+                                <span className="text-zinc-200 font-bold">
+                                  Folge {ep.episode_number}
+                                </span>
+                                {ep.runtime && (
+                                  <>
+                                    <span aria-hidden="true">·</span>
+                                    <span>{ep.runtime} Min.</span>
+                                  </>
+                                )}
+                                {ep.air_date && (
+                                  <>
+                                    <span aria-hidden="true">·</span>
+                                    <span>{ep.air_date.substring(0, 4)}</span>
+                                  </>
+                                )}
+                              </div>
+                              <h4 className="text-[clamp(0.85rem,2.3vw,1rem)] font-bold text-white leading-snug mb-1 group-hover:text-zinc-200 transition-colors line-clamp-1">
+                                {ep.name}
+                              </h4>
+                              <p className="text-[clamp(0.75rem,1.9vw,0.85rem)] text-zinc-400 line-clamp-2 leading-relaxed">
+                                {ep.overview}
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )
                 )}
               </div>
             )}
@@ -1708,13 +1795,13 @@ export const DetailView: React.FC<DetailViewProps> = ({
               />
               <div className="absolute inset-0 bg-black/55 group-hover:bg-black/40 transition-colors flex flex-col items-center justify-center p-5 text-center">
                 <span className="text-zinc-300 text-xs font-semibold mb-1.5">
-                  Part of the Collection
+                  Teil der Filmreihe
                 </span>
                 <h3 className="text-[length:var(--fluid-h1)] font-black text-white mb-4 drop-shadow-xl">
                   {(i as MovieDetails).belongs_to_collection!.name}
                 </h3>
                 <div className="bg-white text-black px-5 py-2 rounded-xl font-bold text-xs sm:text-sm">
-                  Explore Collection
+                  Filmreihe entdecken
                 </div>
               </div>
             </div>
@@ -1728,10 +1815,10 @@ export const DetailView: React.FC<DetailViewProps> = ({
           <div className="mt-12 space-y-5">
             <h3 className="text-white font-bold text-[length:var(--fluid-h2)]">
               {isPerson
-                ? 'Known For'
+                ? 'Bekannt für'
                 : isCollection
-                ? 'Movies in Collection'
-                : 'Studio Releases'}
+                ? 'Filme der Reihe'
+                : 'Studio-Produktionen'}
             </h3>
             <TetrisGrid
               items={collectionParts || combinedCredits || companyMovies || []}
@@ -1999,7 +2086,7 @@ export const DetailView: React.FC<DetailViewProps> = ({
               <X size={20} />
             </button>
 
-            <h3 className="text-xl font-bold text-white mb-1">Rate This Title</h3>
+            <h3 className="text-xl font-bold text-white mb-1">Titel bewerten</h3>
             <p className="text-zinc-400 text-sm mb-6 line-clamp-1">{title}</p>
 
             {ratingSuccess ? (
@@ -2007,7 +2094,7 @@ export const DetailView: React.FC<DetailViewProps> = ({
                 <div className="w-14 h-14 bg-green-500 rounded-full flex items-center justify-center text-black mb-3">
                   <Check size={28} strokeWidth={4} />
                 </div>
-                <span className="text-lg font-bold text-white">Saved</span>
+                <span className="text-lg font-bold text-white">Gespeichert</span>
               </div>
             ) : (
               <>
@@ -2031,7 +2118,7 @@ export const DetailView: React.FC<DetailViewProps> = ({
                   disabled={isSubmittingRating}
                   className="w-full bg-white text-black font-bold py-3.5 rounded-xl active:scale-[0.98] transition-all"
                 >
-                  {isSubmittingRating ? 'Saving...' : 'Submit Rating'}
+                  {isSubmittingRating ? 'Wird gespeichert...' : 'Bewertung speichern'}
                 </button>
               </>
             )}

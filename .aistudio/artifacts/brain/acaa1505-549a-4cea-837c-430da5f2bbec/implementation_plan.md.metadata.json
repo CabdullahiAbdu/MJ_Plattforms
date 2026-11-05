@@ -1,6 +1,6 @@
 {
-  "summary": "Vollständiger Architektur-, Infrastruktur-, UI/UX- und Dual-Release-Plan (PWA/Smart-TV + Native Capacitor App Store) inklusive Layout-Shift-freien Staffel-Episoden-Skeletons, Offline-Service-Worker, Cloud-Run-Key-Pool-Persistenz und Multi-Device-Episoden-Sync.",
-  "updatedAt": "2026-11-05T19:24:09.434052609Z",
+  "summary": "Vollständiger Umsetzungsplan zur strikten Abarbeitung aller Befunde aus AUDIT_FINDINGS (Phase 1 Sicherheit SEC-01 bis SEC-07 & LEG-01, Phase 2 Performance PERF-01 bis PERF-10, Phase 3 Zuverlässigkeit REL-01 bis REL-06, Phase 4 Code-Qualität & Barrierefreiheit QUAL-01 bis QUAL-04, A11Y-01/02, UX-01).",
+  "updatedAt": "2026-11-05T19:42:48.440963551Z",
   "requestFeedback": true,
   "userFacing": true
 }

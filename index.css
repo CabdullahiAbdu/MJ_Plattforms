@@ -4,7 +4,6 @@
   --font-sans: 'DM Sans', -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, sans-serif;
   --font-display: 'Plus Jakarta Sans', 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
-  --font-script: 'Pacifico', cursive;
 
   --color-accent: rgb(var(--accent-color));
   --color-accent-50: rgb(var(--accent-color-light) / 0.05);
@@ -296,6 +295,9 @@ html[data-perf-tier="low"] [class*="shadow-2xl"] {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+  .cinema-shimmer {
+    animation: none !important;
   }
 }
 

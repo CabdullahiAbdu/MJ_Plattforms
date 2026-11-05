@@ -274,124 +274,22 @@ service cloud.firestore {
       }
     }
 
-    // 4. L2 Regional Shared Cache (/regionalCache/{cacheKey})
-    function isValidRegionalCacheEntry(data) {
-      return data.keys().hasAll([
-          'cacheKey',
-          'region',
-          'language',
-          'endpoint',
-          'payloadJson',
-          'expiresAt',
-          'updatedAt'
-        ]) &&
-        data.keys().hasOnly([
-          'cacheKey',
-          'region',
-          'language',
-          'endpoint',
-          'payloadJson',
-          'expiresAt',
-          'updatedAt'
-        ]) &&
-        data.cacheKey is string && isValidId(data.cacheKey) &&
-        data.region is string && data.region.size() >= 2 && data.region.size() <= 5 && data.region.matches('^[A-Z]{2,5}$') &&
-        data.language is string && data.language.size() >= 2 && data.language.size() <= 10 && data.language.matches('^[a-zA-Z\\-]{2,10}$') &&
-        data.endpoint is string && data.endpoint.size() >= 1 && data.endpoint.size() <= 200 &&
-        data.payloadJson is string && data.payloadJson.size() >= 2 && data.payloadJson.size() <= 900000 &&
-        data.expiresAt is number && data.expiresAt > 0 &&
-        data.updatedAt is number && data.updatedAt > 0;
-    }
-
+    // 4. L2 Regional Shared Cache (/regionalCache/{cacheKey}) — Locked against direct client access (SEC-02)
     match /regionalCache/{cacheKey} {
-      allow get: if isValidId(cacheKey);
-      allow list: if false;
-      allow create, update: if isValidId(cacheKey) &&
-        isValidRegionalCacheEntry(incoming()) &&
-        incoming().cacheKey == cacheKey;
-      allow delete: if false;
+      allow read, write: if false;
     }
 
-    // 5. Zero-Credential Server Proxy Queue (/tmdbProxyQueue/{requestId})
-    function isValidTmdbProxyQueueEntry(data) {
-      return data.keys().hasAll([
-          'requestId',
-          'cacheKey',
-          'endpoint',
-          'queryJson',
-          'region',
-          'language',
-          'status',
-          'statusCode',
-          'responseJson',
-          'createdAt',
-          'updatedAt'
-        ]) &&
-        data.keys().hasOnly([
-          'requestId',
-          'cacheKey',
-          'endpoint',
-          'queryJson',
-          'region',
-          'language',
-          'status',
-          'statusCode',
-          'responseJson',
-          'createdAt',
-          'updatedAt'
-        ]) &&
-        data.requestId is string && isValidId(data.requestId) &&
-        data.cacheKey is string && isValidId(data.cacheKey) &&
-        data.endpoint is string && data.endpoint.size() >= 1 && data.endpoint.size() <= 200 &&
-        data.queryJson is string && data.queryJson.size() >= 2 && data.queryJson.size() <= 1000 &&
-        data.region is string && data.region.size() >= 2 && data.region.size() <= 5 && data.region.matches('^[A-Z]{2,5}$') &&
-        data.language is string && data.language.size() >= 2 && data.language.size() <= 10 && data.language.matches('^[a-zA-Z\\-]{2,10}$') &&
-        data.status is string && (data.status == 'pending' || data.status == 'completed' || data.status == 'error') &&
-        data.statusCode is number && data.statusCode >= 0 && data.statusCode <= 599 &&
-        data.responseJson is string && data.responseJson.size() <= 900000 &&
-        data.createdAt is number && data.createdAt > 0 &&
-        data.updatedAt is number && data.updatedAt > 0;
-    }
-
+    // 5. Server Proxy Queue (/tmdbProxyQueue/{requestId}) — Deprecated & locked against client access (SEC-02 / REL-03)
     match /tmdbProxyQueue/{requestId} {
-      allow get: if isValidId(requestId);
-      allow list: if resource.data.status == 'pending';
-      allow create, update: if isValidId(requestId) &&
-        isValidTmdbProxyQueueEntry(incoming()) &&
-        incoming().requestId == requestId;
-      allow delete: if isValidId(requestId);
+      allow read, write: if false;
     }
 
-    // 6. Server-Encrypted TMDB Key Pool Vault (/serverKeyVault/{vaultId})
-    function isValidServerKeyVaultEntry(data) {
-      return data.keys().hasAll([
-          'vaultId',
-          'encryptedPayload',
-          'keyCount',
-          'updatedAt'
-        ]) &&
-        data.keys().hasOnly([
-          'vaultId',
-          'encryptedPayload',
-          'keyCount',
-          'updatedAt'
-        ]) &&
-        data.vaultId is string && isValidId(data.vaultId) &&
-        data.encryptedPayload is string && data.encryptedPayload.size() >= 10 && data.encryptedPayload.size() <= 20000 &&
-        data.keyCount is number && data.keyCount >= 0 && data.keyCount <= 25 &&
-        data.updatedAt is number && data.updatedAt > 0;
-    }
-
+    // 6. Server-Encrypted TMDB Key Pool Vault (/serverKeyVault/{vaultId}) — Locked against client access (SEC-02)
     match /serverKeyVault/{vaultId} {
-      allow get: if isValidId(vaultId);
-      allow list: if false;
-      allow create, update: if isValidId(vaultId) &&
-        isValidServerKeyVaultEntry(incoming()) &&
-        incoming().vaultId == vaultId;
-      allow delete: if false;
+      allow read, write: if false;
     }
 
-    // 7. Server-Encrypted User 2FA Vault (/userSecurityVault/{userId})
+    // 7. Server-Encrypted User 2FA Vault (/userSecurityVault/{userId}) — Strict Owner-Only Access (SEC-02)
     function isValidUserSecurityVaultEntry(data) {
       return data.keys().hasAll([
           'uid',
@@ -408,6 +306,7 @@ service cloud.firestore {
           'updatedAt'
         ]) &&
         data.uid is string && isValidId(data.uid) &&
+        data.uid == request.auth.uid &&
         data.twoFactorEnabled is bool &&
         data.encryptedTotpSecret is string && data.encryptedTotpSecret.size() <= 2000 &&
         data.backupCodeHashesJson is string && data.backupCodeHashesJson.size() >= 2 && data.backupCodeHashesJson.size() <= 4000 &&
@@ -415,15 +314,16 @@ service cloud.firestore {
     }
 
     match /userSecurityVault/{userId} {
-      allow get: if isValidId(userId);
+      allow get: if isOwner(userId) && isValidId(userId);
       allow list: if false;
-      allow create, update: if isValidId(userId) &&
+      allow create, update: if isOwner(userId) &&
+        isValidId(userId) &&
         isValidUserSecurityVaultEntry(incoming()) &&
         incoming().uid == userId;
       allow delete: if isOwner(userId) && isValidId(userId);
     }
 
-    // 8. Atomic 1-Document Multi-Device User Library Vault (/userLibraryVault/{userId})
+    // 8. Atomic 1-Document Multi-Device User Library Vault (/userLibraryVault/{userId}) — Strict Owner-Only Access (SEC-02 / REL-06)
     function isValidUserLibraryVaultEntry(data) {
       return data.keys().hasAll([
           'uid',
@@ -438,15 +338,17 @@ service cloud.firestore {
           'updatedAtMs'
         ]) &&
         data.uid is string && isValidId(data.uid) &&
+        data.uid == request.auth.uid &&
         data.libraryJson is string && data.libraryJson.size() >= 2 && data.libraryJson.size() <= 900000 &&
         data.itemCount is number && data.itemCount >= 0 && data.itemCount <= 5000 &&
         data.updatedAtMs is number && data.updatedAtMs > 0;
     }
 
     match /userLibraryVault/{userId} {
-      allow get: if isValidId(userId);
+      allow get: if isOwner(userId) && isValidId(userId);
       allow list: if false;
-      allow create, update: if isValidId(userId) &&
+      allow create, update: if isOwner(userId) &&
+        isValidId(userId) &&
         isValidUserLibraryVaultEntry(incoming()) &&
         incoming().uid == userId;
       allow delete: if isOwner(userId) && isValidId(userId);

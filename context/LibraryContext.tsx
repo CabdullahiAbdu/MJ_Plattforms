@@ -75,6 +75,7 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const removedWatchlistKeysRef = useRef<Record<string, number>>({});
   const removedMoviesRef = useRef<Record<string, number>>({});
   const removedShowsRef = useRef<Record<string, number>>({});
+  const removedEpisodesRef = useRef<Record<string, number>>({});
   const vaultSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const scheduleAtomicVaultSync = useCallback(
@@ -96,6 +97,7 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
         removedWatchlistKeys: { ...removedWatchlistKeysRef.current },
         removedMovies: { ...removedMoviesRef.current },
         removedShows: { ...removedShowsRef.current },
+        removedEpisodes: { ...removedEpisodesRef.current },
       };
 
       if (vaultSyncTimerRef.current) {
@@ -166,6 +168,12 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
         removedShowsRef.current = {
           ...removedShowsRef.current,
           ...remoteSnap.removedShows,
+        };
+      }
+      if (remoteSnap.removedEpisodes) {
+        removedEpisodesRef.current = {
+          ...removedEpisodesRef.current,
+          ...remoteSnap.removedEpisodes,
         };
       }
       watchlistRef.current = remoteSnap.watchlist;
@@ -266,6 +274,12 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
       setWatchedEpisodes((prev) => {
         const currentList = prev[seriesId] || [];
         const exists = currentList.includes(episodeId);
+        const epKey = `${seriesId}:${episodeId}`;
+        if (exists) {
+          removedEpisodesRef.current[epKey] = Date.now();
+        } else {
+          delete removedEpisodesRef.current[epKey];
+        }
         const newList = exists
           ? currentList.filter((id) => id !== episodeId)
           : [...currentList, episodeId];
