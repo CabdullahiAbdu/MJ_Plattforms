@@ -1,14 +1,15 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, memo } from 'react';
 import { MediaItem, Rect, AppView, resolveMediaType } from '../types';
 import { Star, Check, Eye } from './Icons';
 import { TmdbService } from '../services/tmdb';
 import { SafeImage } from './SafeImage';
 import { haptics } from '../services/haptics';
+import { detectTvUserAgent, getOptimalCardPosterSize } from '../services/performanceMonitor';
 
 interface MediaCardProps {
   item: MediaItem;
   onClick: (item: MediaItem, rect?: Rect) => void;
-  imageUrl: string;
+  imageUrl?: string;
   className?: string;
   index?: number;
   variant?: 'poster' | 'backdrop' | 'ranked' | 'masonry' | 'landscape';
@@ -27,7 +28,7 @@ interface MediaCardProps {
  * Fluid viewport-proportional poster, backdrop, ranked, and grid cards
  * with instant tap response, 380ms iOS Long-Press Quick Peek, and 150ms Hover/Focus Intent preloading.
  */
-export const MediaCard: React.FC<MediaCardProps> = ({
+const MediaCardComponent: React.FC<MediaCardProps> = ({
   item,
   onClick,
   imageUrl,
@@ -46,6 +47,22 @@ export const MediaCard: React.FC<MediaCardProps> = ({
   const rating = Number.isFinite(numVote) && numVote > 0 ? numVote.toFixed(1) : null;
   const mediaType = resolveMediaType(item);
   const year = String(item?.release_date || item?.first_air_date || '').substring(0, 4);
+
+  const rawImagePath =
+    variant === 'backdrop' || variant === 'landscape'
+      ? item?.backdrop_path || item?.poster_path || item?.profile_path
+      : item?.poster_path || item?.profile_path || item?.backdrop_path;
+  const optimalSize = getOptimalCardPosterSize(variant);
+  const resolvedImageUrl =
+    imageUrl ||
+    (rawImagePath
+      ? tmdb
+        ? tmdb.getImageUrl(rawImagePath, optimalSize)
+        : rawImagePath.startsWith('http')
+        ? rawImagePath
+        : `https://image.tmdb.org/t/p/${optimalSize}${rawImagePath.startsWith('/') ? '' : '/'}${rawImagePath}`
+      : '');
+
   const cardRef = useRef<HTMLDivElement>(null);
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -78,13 +95,22 @@ export const MediaCard: React.FC<MediaCardProps> = ({
   const triggerIntentPreload = () => {
     clearHoverTimer();
     if (!tmdb) return;
+    // Phase 5: Disable hover-intent network preloading on touch devices & Smart TVs
+    if (detectTvUserAgent()) return;
+    if (
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(hover: none)').matches
+    ) {
+      return;
+    }
     hoverTimerRef.current = setTimeout(() => {
       let view = AppView.DETAILS;
       if (mediaType === 'person') view = AppView.PERSON;
       else if (mediaType === 'collection') view = AppView.COLLECTION;
       else if (mediaType === 'company') view = AppView.COMPANY;
       tmdb.preloadDetails(item.id, mediaType, view);
-    }, 150);
+    }, 220);
   };
 
   const handleEnter = () => {
@@ -251,7 +277,7 @@ export const MediaCard: React.FC<MediaCardProps> = ({
           <WatchedOverlay />
           <ActionButtons />
           <SafeImage
-            src={imageUrl}
+            src={resolvedImageUrl}
             fallbackTitle={title}
             mediaType={mediaType}
             className="w-full h-full object-cover"
@@ -289,7 +315,7 @@ export const MediaCard: React.FC<MediaCardProps> = ({
           <WatchedOverlay />
           <ActionButtons />
           <SafeImage
-            src={imageUrl}
+            src={resolvedImageUrl}
             fallbackTitle={title}
             mediaType={mediaType}
             className="w-full h-full object-cover opacity-90 group-hover:opacity-100 transition-opacity"
@@ -340,7 +366,7 @@ export const MediaCard: React.FC<MediaCardProps> = ({
           <WatchedOverlay />
           <ActionButtons />
           <SafeImage
-            src={imageUrl}
+            src={resolvedImageUrl}
             fallbackTitle={title}
             mediaType={mediaType}
             className="w-full h-full object-cover"
@@ -391,7 +417,7 @@ export const MediaCard: React.FC<MediaCardProps> = ({
         <WatchedOverlay />
         <ActionButtons />
         <SafeImage
-          src={imageUrl}
+          src={resolvedImageUrl}
           fallbackTitle={title}
           mediaType={mediaType}
           className="w-full h-full object-cover"
@@ -417,3 +443,19 @@ export const MediaCard: React.FC<MediaCardProps> = ({
     </div>
   );
 };
+
+export const MediaCard = memo(
+  MediaCardComponent,
+  (prev, next) =>
+    prev.item.id === next.item.id &&
+    prev.item.poster_path === next.item.poster_path &&
+    prev.item.backdrop_path === next.item.backdrop_path &&
+    prev.item.profile_path === next.item.profile_path &&
+    prev.imageUrl === next.imageUrl &&
+    prev.variant === next.variant &&
+    prev.index === next.index &&
+    prev.isWatched === next.isWatched &&
+    prev.bottomInfo === next.bottomInfo &&
+    prev.bottomInfoColor === next.bottomInfoColor &&
+    prev.className === next.className
+);

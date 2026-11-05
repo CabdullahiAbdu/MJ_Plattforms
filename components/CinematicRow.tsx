@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
 import { ChevronRight, ChevronLeft, RefreshCw } from './Icons';
 import { MediaItem, TmdbResponse, Rect } from '../types';
 import { TmdbService } from '../services/tmdb';
 import { MediaCard } from './MovieCard';
+import { getOptimalCardPosterSize } from '../services/performanceMonitor';
 
 interface CinematicRowProps {
   title: string;
@@ -13,9 +14,10 @@ interface CinematicRowProps {
   onClick: (item: MediaItem, rect?: Rect) => void;
   onExtend: () => void;
   variant?: 'poster' | 'backdrop' | 'ranked';
+  priority?: 'eager' | 'lazy';
 }
 
-export const CinematicRow: React.FC<CinematicRowProps> = ({
+const CinematicRowComponent: React.FC<CinematicRowProps> = ({
   title,
   subtitle,
   queryKey,
@@ -24,15 +26,44 @@ export const CinematicRow: React.FC<CinematicRowProps> = ({
   onClick,
   onExtend,
   variant = 'poster',
+  priority = 'lazy',
 }) => {
   const [items, setItems] = useState<MediaItem[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<boolean>(false);
+  const [shouldFetch, setShouldFetch] = useState<boolean>(
+    priority === 'eager' || typeof IntersectionObserver === 'undefined'
+  );
+  const containerRef = useRef<HTMLDivElement>(null);
   const rowRef = useRef<HTMLDivElement>(null);
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
 
   const effectiveKey = queryKey || `${title}:${tmdb.getLanguage()}:${tmdb.getRegion()}`;
+
+  // Phase 2: Defer offscreen row network requests until near viewport (360px rootMargin)
+  useEffect(() => {
+    if (shouldFetch || typeof IntersectionObserver === 'undefined') {
+      setShouldFetch(true);
+      return;
+    }
+    const el = containerRef.current;
+    if (!el) {
+      setShouldFetch(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setShouldFetch(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '360px 0px' }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [shouldFetch]);
 
   const loadRow = useCallback(async () => {
     setLoading(true);
@@ -51,6 +82,7 @@ export const CinematicRow: React.FC<CinematicRowProps> = ({
   }, [title]);
 
   useEffect(() => {
+    if (!shouldFetch) return;
     let mounted = true;
     setLoading(true);
     setError(false);
@@ -74,7 +106,7 @@ export const CinematicRow: React.FC<CinematicRowProps> = ({
     return () => {
       mounted = false;
     };
-  }, [effectiveKey]);
+  }, [effectiveKey, shouldFetch]);
 
   const scroll = (direction: 'left' | 'right') => {
     if (rowRef.current) {
@@ -84,9 +116,13 @@ export const CinematicRow: React.FC<CinematicRowProps> = ({
     }
   };
 
-  if (loading && items.length === 0) {
+  const optimalPosterSize = getOptimalCardPosterSize(
+    variant as 'poster' | 'backdrop' | 'ranked' | 'masonry' | 'landscape'
+  );
+
+  if ((!shouldFetch || loading) && items.length === 0) {
     return (
-      <div className="py-2.5 md:py-4 px-[var(--fluid-page-px)]">
+      <div ref={containerRef} className="py-2.5 md:py-4 px-[var(--fluid-page-px)]">
         <div className="h-5 w-40 cinema-shimmer rounded-lg mb-2.5" />
         <div className="flex gap-[clamp(0.65rem,1.8vw,1rem)] overflow-hidden">
           {Array.from({ length: 6 }).map((_, i) => (
@@ -110,7 +146,7 @@ export const CinematicRow: React.FC<CinematicRowProps> = ({
 
   if (error && items.length === 0) {
     return (
-      <div className="py-2.5 md:py-4 px-[var(--fluid-page-px)]">
+      <div ref={containerRef} className="py-2.5 md:py-4 px-[var(--fluid-page-px)]">
         <div className="flex items-center justify-between p-4 rounded-2xl bg-zinc-900/60">
           <div>
             <h3 className="text-[length:var(--fluid-h3)] font-bold text-white">{title}</h3>
@@ -131,7 +167,7 @@ export const CinematicRow: React.FC<CinematicRowProps> = ({
   if (items.length === 0) return null;
 
   return (
-    <div className="relative py-2 md:py-3.5 group/row">
+    <div ref={containerRef} className="relative py-2 md:py-3.5 group/row">
       {/* Fluid Header */}
       <div className="relative z-10 px-[var(--fluid-page-px)] mb-2 md:mb-3 flex items-end justify-between">
         <button
@@ -149,11 +185,6 @@ export const CinematicRow: React.FC<CinematicRowProps> = ({
               strokeWidth={2.5}
             />
           </h3>
-          {subtitle && (
-            <p className="text-zinc-400 font-normal text-[clamp(0.68rem,calc(0.64rem+0.15vw),0.8rem)] mt-0.5">
-              {subtitle}
-            </p>
-          )}
         </button>
 
         {/* Desktop & Smart TV Pointer Nav Controls (Ignored by D-Pad Remote) */}
@@ -195,7 +226,7 @@ export const CinematicRow: React.FC<CinematicRowProps> = ({
                 variant === 'backdrop'
                   ? item.backdrop_path || item.poster_path
                   : item.poster_path || item.profile_path || item.backdrop_path,
-                'w500'
+                optimalPosterSize
               )}
               onClick={onClick}
               variant={variant}
@@ -219,3 +250,5 @@ export const CinematicRow: React.FC<CinematicRowProps> = ({
     </div>
   );
 };
+
+export const CinematicRow = memo(CinematicRowComponent);

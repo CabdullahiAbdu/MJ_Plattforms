@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import zlib from 'zlib';
 import { fileURLToPath } from 'url';
 import QRCode from 'qrcode';
 import { GoogleGenAI } from '@google/genai';
@@ -13,6 +14,7 @@ import {
   doc,
   getDoc,
   setDoc,
+  deleteDoc,
   collection,
   query,
   where,
@@ -22,13 +24,38 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+
+export function computeWeakEtag(payloadStr: string): string {
+  const hash = crypto.createHash('sha1').update(payloadStr).digest('base64url').slice(0, 20);
+  return `W/"${payloadStr.length.toString(16)}-${hash}"`;
+}
+
+export function logStructured(
+  severity: 'INFO' | 'WARNING' | 'ERROR',
+  message: string,
+  meta: Record<string, unknown> = {}
+): void {
+  const entry = {
+    severity,
+    message,
+    timestamp: new Date().toISOString(),
+    ...meta,
+  };
+  if (severity === 'ERROR') {
+    console.error(JSON.stringify(entry));
+  } else {
+    console.log(JSON.stringify(entry));
+  }
+}
 const CACHE_DIR = path.join(__dirname, '.cache');
 const VAULT_FILE = path.join(CACHE_DIR, 'tmdb-server-vault.json');
 const DISK_CACHE_FILE = path.join(CACHE_DIR, 'tmdb-regional-cache.json');
 const SECURITY_VAULT_FILE = path.join(CACHE_DIR, 'user-2fa-vault.json');
 const USER_SYNC_VAULT_FILE = path.join(CACHE_DIR, 'user-cloud-sync-vault.json');
+const QUOTA_GUARD_FILE = path.join(CACHE_DIR, 'daily-quota-guard.json');
 const FIREBASE_CONFIG_FILE = path.join(__dirname, 'firebase-applet-config.json');
+const ADMIN_OWNER_EMAIL = 'infoc232@gmail.com';
 
 // Ensure .cache directory exists
 try {
@@ -37,6 +64,120 @@ try {
   }
 } catch {
   // ignore
+}
+
+// --- Automatic Daily Cloud Cost & Quota Guard (100% Free-Tier / Trial Credit Protection) ---
+export interface DailyCloudQuotaSnapshot {
+  utcDay: string;
+  firestoreReads: number;
+  firestoreWrites: number;
+  aiCalls: number;
+  maxFirestoreReads: number;
+  maxFirestoreWrites: number;
+  maxAiCalls: number;
+  quotaGuardActive: boolean;
+}
+
+const MAX_DAILY_SERVER_FIRESTORE_READS = 15000;
+const MAX_DAILY_SERVER_FIRESTORE_WRITES = 6000;
+const MAX_DAILY_SERVER_AI_CALLS = 300;
+
+let dailyQuotaState = {
+  utcDay: new Date().toISOString().slice(0, 10),
+  firestoreReads: 0,
+  firestoreWrites: 0,
+  aiCalls: 0,
+};
+
+try {
+  if (fs.existsSync(QUOTA_GUARD_FILE)) {
+    const rawQ = JSON.parse(fs.readFileSync(QUOTA_GUARD_FILE, 'utf-8'));
+    const today = new Date().toISOString().slice(0, 10);
+    if (rawQ && rawQ.utcDay === today) {
+      dailyQuotaState = {
+        utcDay: today,
+        firestoreReads: Math.max(0, Number(rawQ.firestoreReads || 0)),
+        firestoreWrites: Math.max(0, Number(rawQ.firestoreWrites || 0)),
+        aiCalls: Math.max(0, Number(rawQ.aiCalls || 0)),
+      };
+    }
+  }
+} catch {
+  // ignore
+}
+
+let quotaSaveTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleQuotaGuardPersist(): void {
+  if (quotaSaveTimer) return;
+  quotaSaveTimer = setTimeout(() => {
+    quotaSaveTimer = null;
+    try {
+      fs.writeFileSync(QUOTA_GUARD_FILE, JSON.stringify(dailyQuotaState), 'utf-8');
+    } catch {
+      // ignore
+    }
+  }, 3000);
+  quotaSaveTimer.unref?.();
+}
+
+function syncUtcDayRollover(): void {
+  const today = new Date().toISOString().slice(0, 10);
+  if (dailyQuotaState.utcDay !== today) {
+    dailyQuotaState = {
+      utcDay: today,
+      firestoreReads: 0,
+      firestoreWrites: 0,
+      aiCalls: 0,
+    };
+    serverFirestoreQuotaExhausted = false;
+    scheduleQuotaGuardPersist();
+  }
+}
+
+export function canUseServerFirestoreRead(cost: number = 1): boolean {
+  syncUtcDayRollover();
+  if (serverFirestoreQuotaExhausted) return false;
+  if (dailyQuotaState.firestoreReads + cost > MAX_DAILY_SERVER_FIRESTORE_READS) {
+    return false;
+  }
+  dailyQuotaState.firestoreReads += cost;
+  scheduleQuotaGuardPersist();
+  return true;
+}
+
+export function canUseServerFirestoreWrite(cost: number = 1): boolean {
+  syncUtcDayRollover();
+  if (serverFirestoreQuotaExhausted) return false;
+  if (dailyQuotaState.firestoreWrites + cost > MAX_DAILY_SERVER_FIRESTORE_WRITES) {
+    return false;
+  }
+  dailyQuotaState.firestoreWrites += cost;
+  scheduleQuotaGuardPersist();
+  return true;
+}
+
+export function canUseServerAiCall(): boolean {
+  syncUtcDayRollover();
+  if (dailyQuotaState.aiCalls + 1 > MAX_DAILY_SERVER_AI_CALLS) {
+    return false;
+  }
+  dailyQuotaState.aiCalls += 1;
+  scheduleQuotaGuardPersist();
+  return true;
+}
+
+export function getDailyCloudQuotaSnapshot(): DailyCloudQuotaSnapshot {
+  syncUtcDayRollover();
+  return {
+    ...dailyQuotaState,
+    maxFirestoreReads: MAX_DAILY_SERVER_FIRESTORE_READS,
+    maxFirestoreWrites: MAX_DAILY_SERVER_FIRESTORE_WRITES,
+    maxAiCalls: MAX_DAILY_SERVER_AI_CALLS,
+    quotaGuardActive:
+      serverFirestoreQuotaExhausted ||
+      dailyQuotaState.firestoreReads >= MAX_DAILY_SERVER_FIRESTORE_READS ||
+      dailyQuotaState.firestoreWrites >= MAX_DAILY_SERVER_FIRESTORE_WRITES,
+  };
 }
 
 // --- Initialize Server-Side Firestore L2 Bridge ---
@@ -88,7 +229,7 @@ const VAULT_CIPHER_KEY = crypto.scryptSync(
   32
 );
 
-function encryptForServerVault(plainText: string): string {
+export function encryptForServerVault(plainText: string): string {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', VAULT_CIPHER_KEY, iv);
   const encrypted = Buffer.concat([cipher.update(plainText, 'utf8'), cipher.final()]);
@@ -96,7 +237,7 @@ function encryptForServerVault(plainText: string): string {
   return `${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
 }
 
-function decryptFromServerVault(cipherPayload: string): string | null {
+export function decryptFromServerVault(cipherPayload: string): string | null {
   try {
     const parts = (cipherPayload || '').split(':');
     if (parts.length !== 3) return null;
@@ -110,6 +251,13 @@ function decryptFromServerVault(cipherPayload: string): string | null {
   } catch {
     return null;
   }
+}
+
+export function timingSafeEqualStrings(a: string, b: string): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;
+  const digestA = crypto.createHmac('sha256', VAULT_CIPHER_KEY).update(a).digest();
+  const digestB = crypto.createHmac('sha256', VAULT_CIPHER_KEY).update(b).digest();
+  return crypto.timingSafeEqual(digestA, digestB) && a.length === b.length;
 }
 
 // --- Multi-Key TMDB Failover Pool (Supports 5-10+ Rotating Keys with Circuit Breaker) ---
@@ -505,6 +653,7 @@ function scheduleDiskCachePersist() {
       // ignore
     }
   }, 5000);
+  persistTimeout.unref?.();
 }
 
 function getTtlMsForEndpoint(endpoint: string): number {
@@ -569,17 +718,30 @@ export function normalizeQueryParamValue(key: string, value: any): string {
   return raw;
 }
 
+const IGNORED_CACHE_QUERY_KEYS = new Set(['api_key', '_', 'cb', 'timestamp', 'cacheBuster']);
+
 export function buildDeterministicCacheKey(
   region: string,
   language: string,
   endpoint: string,
   queryObj: Record<string, any>
 ): string {
-  const cleanRegion = (region || 'DE').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 5) || 'DE';
-  const cleanLang = (language || 'de-DE').replace(/[^a-zA-Z\-]/g, '').slice(0, 10) || 'de-DE';
-  const cleanEndpoint = endpoint.replace(/^\/+|\/+$/g, '');
-  const sortedPairs = Object.keys(queryObj)
-    .filter((k) => k !== 'api_key' && queryObj[k] !== undefined && queryObj[k] !== null)
+  const cleanRegion =
+    region === 'DE' || region === 'US' || region === 'GB'
+      ? region
+      : String(region || 'DE')
+          .toUpperCase()
+          .replace(/[^A-Z]/g, '')
+          .slice(0, 5) || 'DE';
+  const cleanLang =
+    language === 'de-DE' || language === 'en-US'
+      ? language
+      : String(language || 'de-DE')
+          .replace(/[^a-zA-Z\-]/g, '')
+          .slice(0, 10) || 'de-DE';
+  const cleanEndpoint = String(endpoint || '').replace(/^\/+|\/+$/g, '');
+  const sortedPairs = Object.keys(queryObj || {})
+    .filter((k) => !IGNORED_CACHE_QUERY_KEYS.has(k) && queryObj[k] !== undefined && queryObj[k] !== null)
     .sort()
     .map((k) => `${k}=${normalizeQueryParamValue(k, queryObj[k])}`)
     .join('&');
@@ -604,31 +766,47 @@ export function buildDeterministicCacheKey(
 }
 
 /**
- * Compacts large TMDB responses (e.g., aggregate details with 500 cast/crew or 200 images)
+ * Compacts large TMDB responses (e.g., aggregate details with 500 cast/crew or 200 images/videos)
  * so serialized JSON is always fast and safely within Firestore's document size limits (< 350 KB).
  */
-function compactTmdbPayloadForCache(payload: any): any {
+export function compactTmdbPayloadForCache(payload: any): any {
   if (!payload || typeof payload !== 'object') return payload;
   try {
     const rawStr = JSON.stringify(payload);
     if (rawStr.length <= 320000) return payload;
 
+    const compactPersonEntry = (c: any) => ({
+      id: c.id,
+      name: c.name,
+      original_name: c.original_name,
+      character: c.character,
+      job: c.job,
+      department: c.department,
+      profile_path: c.profile_path,
+      order: c.order,
+      total_episode_count: c.total_episode_count,
+    });
+
     const clone: any = { ...payload };
     if (clone.credits) {
       clone.credits = {
         ...clone.credits,
-        cast: Array.isArray(clone.credits.cast) ? clone.credits.cast.slice(0, 45) : [],
-        crew: Array.isArray(clone.credits.crew) ? clone.credits.crew.slice(0, 45) : [],
+        cast: Array.isArray(clone.credits.cast)
+          ? clone.credits.cast.slice(0, 35).map(compactPersonEntry)
+          : [],
+        crew: Array.isArray(clone.credits.crew)
+          ? clone.credits.crew.slice(0, 35).map(compactPersonEntry)
+          : [],
       };
     }
     if (clone.aggregate_credits) {
       clone.aggregate_credits = {
         ...clone.aggregate_credits,
         cast: Array.isArray(clone.aggregate_credits.cast)
-          ? clone.aggregate_credits.cast.slice(0, 45)
+          ? clone.aggregate_credits.cast.slice(0, 35).map(compactPersonEntry)
           : [],
         crew: Array.isArray(clone.aggregate_credits.crew)
-          ? clone.aggregate_credits.crew.slice(0, 35)
+          ? clone.aggregate_credits.crew.slice(0, 30).map(compactPersonEntry)
           : [],
       };
     }
@@ -641,6 +819,22 @@ function compactTmdbPayloadForCache(payload: any): any {
         crew: Array.isArray(clone.combined_credits.crew)
           ? clone.combined_credits.crew.slice(0, 40)
           : [],
+      };
+    }
+    if (clone.videos?.results && Array.isArray(clone.videos.results)) {
+      clone.videos = {
+        ...clone.videos,
+        results: clone.videos.results
+          .filter((v: any) => v && v.site === 'YouTube' && v.key)
+          .slice(0, 12)
+          .map((v: any) => ({
+            id: v.id,
+            key: v.key,
+            name: typeof v.name === 'string' ? v.name.slice(0, 140) : '',
+            site: v.site,
+            type: v.type,
+            official: Boolean(v.official),
+          })),
       };
     }
     if (clone.images) {
@@ -1137,7 +1331,7 @@ setInterval(() => {
       warmRegionCatalogue(reg.region, reg.language);
     }
   }
-}, 15 * 60 * 1000);
+}, 15 * 60 * 1000).unref();
 
 // --- Server-Side Firebase ID Token Verification & RFC 6238 TOTP Two-Factor Authentication ---
 interface VerifiedUserIdentity {
@@ -1241,7 +1435,7 @@ function decodeBase32(base32: string): Buffer {
   return Buffer.from(out);
 }
 
-function computeTotpCode(secretBase32: string, stepCounter: number): string {
+export function computeTotpCode(secretBase32: string, stepCounter: number): string {
   const key = decodeBase32(secretBase32);
   const buf = Buffer.alloc(8);
   buf.writeUInt32BE(Math.floor(stepCounter / 0x100000000), 0);
@@ -1258,10 +1452,14 @@ function computeTotpCode(secretBase32: string, stepCounter: number): string {
   return otp.toString().padStart(6, '0');
 }
 
-function verifyTotpCode(secretBase32: string, userCode: string): boolean {
+export function verifyTotpCode(
+  secretBase32: string,
+  userCode: string,
+  nowMs: number = Date.now()
+): boolean {
   const cleanCode = (userCode || '').replace(/\s+/g, '');
   if (!/^\d{6}$/.test(cleanCode)) return false;
-  const currentStep = Math.floor(Date.now() / 1000 / 30);
+  const currentStep = Math.floor(nowMs / 1000 / 30);
   // Allow ±1 time step (30s drift tolerance)
   for (const delta of [-1, 0, 1]) {
     if (computeTotpCode(secretBase32, currentStep + delta) === cleanCode) {
@@ -1293,7 +1491,7 @@ function hashBackupCode(uid: string, code: string): string {
     .digest('hex');
 }
 
-function signTwoFactorSessionTicket(uid: string): string {
+export function signTwoFactorSessionTicket(uid: string): string {
   const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days
   const payload = `${uid}:${expiresAt}`;
   const sig = crypto
@@ -1303,7 +1501,7 @@ function signTwoFactorSessionTicket(uid: string): string {
   return `${payload}:${sig}`;
 }
 
-function verifyTwoFactorSessionTicket(uid: string, ticket?: string): boolean {
+export function verifyTwoFactorSessionTicket(uid: string, ticket?: string): boolean {
   if (!ticket || typeof ticket !== 'string') return false;
   const parts = ticket.split(':');
   if (parts.length !== 3) return false;
@@ -1315,7 +1513,12 @@ function verifyTwoFactorSessionTicket(uid: string, ticket?: string): boolean {
     .createHmac('sha256', VAULT_CIPHER_KEY)
     .update(`2fa_ticket:${ticketUid}:${expStr}`)
     .digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig));
+  return timingSafeEqualStrings(sig, expectedSig);
+}
+
+export function isAuthorizedAdminOwner(user: VerifiedUserIdentity | null): boolean {
+  if (!user || !user.email) return false;
+  return user.email.trim().toLowerCase() === ADMIN_OWNER_EMAIL;
 }
 
 interface UserSecurityRecord {
@@ -1358,7 +1561,9 @@ function saveLocalUserSecurityCache(): void {
 }
 
 async function getUserSecurityRecord(uid: string): Promise<UserSecurityRecord | null> {
-  if (firestoreDb) {
+  const cached = localUserSecurityCache.get(uid);
+  if (cached) return cached;
+  if (firestoreDb && canUseServerFirestoreRead(1)) {
     try {
       const snap = await getDoc(doc(firestoreDb, 'userSecurityVault', uid));
       if (snap.exists()) {
@@ -1366,8 +1571,8 @@ async function getUserSecurityRecord(uid: string): Promise<UserSecurityRecord | 
         localUserSecurityCache.set(uid, d);
         return d;
       }
-    } catch {
-      // fallback to local cache
+    } catch (err) {
+      handleServerFirestoreQuotaError(err);
     }
   }
   return localUserSecurityCache.get(uid) || null;
@@ -1376,11 +1581,11 @@ async function getUserSecurityRecord(uid: string): Promise<UserSecurityRecord | 
 async function saveUserSecurityRecord(record: UserSecurityRecord): Promise<void> {
   localUserSecurityCache.set(record.uid, record);
   saveLocalUserSecurityCache();
-  if (firestoreDb) {
+  if (firestoreDb && canUseServerFirestoreWrite(1)) {
     try {
       await setDoc(doc(firestoreDb, 'userSecurityVault', record.uid), record);
-    } catch {
-      // ignore
+    } catch (err) {
+      handleServerFirestoreQuotaError(err);
     }
   }
 }
@@ -1398,7 +1603,7 @@ function getAiClient(): GoogleGenAI | null {
   });
 }
 
-const ALLOWED_TMDB_ENDPOINT_REGEX =
+export const ALLOWED_TMDB_ENDPOINT_REGEX =
   /^(authentication\/guest_session\/new|configuration|genre\/(movie|tv)\/list|watch\/providers\/(movie|tv)|movie\/(now_playing|upcoming|top_rated|\d+(\/[a-zA-Z0-9_]+)*)|tv\/(on_the_air|airing_today|top_rated|\d+(\/[a-zA-Z0-9_]+)*)|person\/\d+(\/[a-zA-Z0-9_]+)*|collection\/\d+(\/[a-zA-Z0-9_]+)*|company\/\d+(\/[a-zA-Z0-9_]+)*|keyword\/\d+|discover\/(movie|tv)|trending\/[a-zA-Z0-9_]+\/[a-zA-Z0-9_]+|search\/(multi|movie|tv|person|keyword))$/;
 
 /**
@@ -1409,7 +1614,7 @@ const ALLOWED_TMDB_ENDPOINT_REGEX =
 const activeProxyJobs = new Set<string>();
 
 function startFirestoreProxyBridge(): void {
-  if (!firestoreDb) return;
+  if (!firestoreDb || serverFirestoreQuotaExhausted) return;
 
   const pendingQuery = query(
     collection(firestoreDb, 'tmdbProxyQueue'),
@@ -1450,19 +1655,21 @@ function startFirestoreProxyBridge(): void {
               endpoint.includes('\\') ||
               !ALLOWED_TMDB_ENDPOINT_REGEX.test(endpoint)
             ) {
-              await setDoc(doc(firestoreDb!, 'tmdbProxyQueue', requestId), {
-                requestId,
-                cacheKey,
-                endpoint: endpoint.slice(0, 200) || 'invalid',
-                queryJson: queryJsonStr,
-                region,
-                language,
-                status: 'error',
-                statusCode: 400,
-                responseJson: JSON.stringify({ status_message: 'Disallowed TMDB endpoint.' }),
-                createdAt: Number(data.createdAt || Date.now()),
-                updatedAt: Date.now(),
-              });
+              if (canUseServerFirestoreWrite(1)) {
+                await setDoc(doc(firestoreDb!, 'tmdbProxyQueue', requestId), {
+                  requestId,
+                  cacheKey,
+                  endpoint: endpoint.slice(0, 200) || 'invalid',
+                  queryJson: queryJsonStr,
+                  region,
+                  language,
+                  status: 'error',
+                  statusCode: 400,
+                  responseJson: JSON.stringify({ status_message: 'Disallowed TMDB endpoint.' }),
+                  createdAt: Number(data.createdAt || Date.now()),
+                  updatedAt: Date.now(),
+                });
+              }
               return;
             }
 
@@ -1491,36 +1698,40 @@ function startFirestoreProxyBridge(): void {
             const compacted = compactTmdbPayloadForCache(result.data);
             const responseJson = JSON.stringify(compacted);
 
-            await setDoc(doc(firestoreDb!, 'tmdbProxyQueue', requestId), {
-              requestId,
-              cacheKey,
-              endpoint: endpoint.slice(0, 200),
-              queryJson: queryJsonStr,
-              region,
-              language,
-              status: result.status >= 200 && result.status < 300 ? 'completed' : 'error',
-              statusCode: result.status,
-              responseJson: responseJson.length <= 880000 ? responseJson : '{}',
-              createdAt: Number(data.createdAt || Date.now()),
-              updatedAt: Date.now(),
-            });
-          } catch (err: any) {
-            try {
+            if (canUseServerFirestoreWrite(1)) {
               await setDoc(doc(firestoreDb!, 'tmdbProxyQueue', requestId), {
                 requestId,
-                cacheKey: String(data.cacheKey || requestId).slice(0, 128),
-                endpoint: String(data.endpoint || 'error').slice(0, 200),
-                queryJson: String(data.queryJson || '{}').slice(0, 1000),
-                region: String(data.region || 'DE').slice(0, 5),
-                language: String(data.language || 'de-DE').slice(0, 10),
-                status: 'error',
-                statusCode: 502,
-                responseJson: JSON.stringify({
-                  status_message: err?.message || 'Upstream proxy error',
-                }),
+                cacheKey,
+                endpoint: endpoint.slice(0, 200),
+                queryJson: queryJsonStr,
+                region,
+                language,
+                status: result.status >= 200 && result.status < 300 ? 'completed' : 'error',
+                statusCode: result.status,
+                responseJson: responseJson.length <= 880000 ? responseJson : '{}',
                 createdAt: Number(data.createdAt || Date.now()),
                 updatedAt: Date.now(),
               });
+            }
+          } catch (err: any) {
+            try {
+              if (canUseServerFirestoreWrite(1)) {
+                await setDoc(doc(firestoreDb!, 'tmdbProxyQueue', requestId), {
+                  requestId,
+                  cacheKey: String(data.cacheKey || requestId).slice(0, 128),
+                  endpoint: String(data.endpoint || 'error').slice(0, 200),
+                  queryJson: String(data.queryJson || '{}').slice(0, 1000),
+                  region: String(data.region || 'DE').slice(0, 5),
+                  language: String(data.language || 'de-DE').slice(0, 10),
+                  status: 'error',
+                  statusCode: 502,
+                  responseJson: JSON.stringify({
+                    status_message: err?.message || 'Upstream proxy error',
+                  }),
+                  createdAt: Number(data.createdAt || Date.now()),
+                  updatedAt: Date.now(),
+                });
+              }
             } catch {
               // ignore
             }
@@ -1531,24 +1742,72 @@ function startFirestoreProxyBridge(): void {
       });
     },
     (err) => {
-      console.error('Firestore proxy queue listener error:', err);
+      handleServerFirestoreQuotaError(err);
     }
   );
 }
 
+// --- Tiered Anti-Bot & Anti-Brute-Force Rate Limiter ---
 const rateLimitWindowMs = 60 * 1000;
-const maxRequestsPerMinute = 600;
-const ipRequestCounts = new Map<string, { count: number; resetAt: number }>();
+const ipTierBuckets = new Map<string, { count: number; resetAt: number }>();
+
+export function getRateLimitMaxForPath(reqPath: string): { tier: string; maxPerMinute: number } {
+  if (reqPath.startsWith('/api/auth/')) {
+    return { tier: 'auth', maxPerMinute: 25 };
+  }
+  if (reqPath.startsWith('/api/ai/')) {
+    return { tier: 'ai', maxPerMinute: 15 };
+  }
+  if (reqPath.startsWith('/api/user-sync/')) {
+    return { tier: 'sync', maxPerMinute: 60 };
+  }
+  if (reqPath.startsWith('/api/admin/')) {
+    return { tier: 'admin', maxPerMinute: 20 };
+  }
+  return { tier: 'general', maxPerMinute: 450 };
+}
+
+export function checkTieredRateLimit(
+  ip: string,
+  reqPath: string,
+  nowMs: number = Date.now()
+): { allowed: boolean; remaining: number; limit: number } {
+  const { tier, maxPerMinute } = getRateLimitMaxForPath(reqPath);
+  const bucketKey = `${ip}:${tier}`;
+  const bucket = ipTierBuckets.get(bucketKey);
+  if (!bucket || nowMs > bucket.resetAt) {
+    ipTierBuckets.set(bucketKey, { count: 1, resetAt: nowMs + rateLimitWindowMs });
+    return { allowed: true, remaining: maxPerMinute - 1, limit: maxPerMinute };
+  }
+  bucket.count += 1;
+  if (bucket.count > maxPerMinute) {
+    return { allowed: false, remaining: 0, limit: maxPerMinute };
+  }
+  return { allowed: true, remaining: maxPerMinute - bucket.count, limit: maxPerMinute };
+}
+
+// Periodic cleanup of expired rate-limit buckets every 5 minutes to prevent memory growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of ipTierBuckets.entries()) {
+    if (now > v.resetAt) {
+      ipTierBuckets.delete(k);
+    }
+  }
+}, 5 * 60 * 1000).unref();
 
 async function startServer() {
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '256kb' }));
 
-  // --- Security Headers, Native iOS Capacitor CORS & High-Throughput Rate Limiter ---
+  // --- Hardened Security Headers, Native iOS Capacitor CORS & Tiered Rate Limiter ---
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
 
     if (req.path.startsWith('/api/')) {
       const origin = String(req.headers.origin || '');
@@ -1574,19 +1833,29 @@ async function startServer() {
       const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'local')
         .split(',')[0]
         .trim();
-      const now = Date.now();
-      const bucket = ipRequestCounts.get(ip);
-      if (!bucket || now > bucket.resetAt) {
-        ipRequestCounts.set(ip, { count: 1, resetAt: now + rateLimitWindowMs });
-      } else {
-        bucket.count += 1;
-        if (bucket.count > maxRequestsPerMinute) {
-          res.status(429).json({ error: 'Too many requests. Please slow down.' });
-          return;
-        }
+      const rateCheck = checkTieredRateLimit(ip, req.path);
+      res.setHeader('X-RateLimit-Limit', String(rateCheck.limit));
+      res.setHeader('X-RateLimit-Remaining', String(rateCheck.remaining));
+      if (!rateCheck.allowed) {
+        res.status(429).json({ error: 'Too many requests. Please slow down.' });
+        return;
       }
     }
     next();
+  });
+
+  // --- 0. Cloud Run Liveness & Readiness Health Endpoint ---
+  app.get('/health', (_req, res) => {
+    const mem = process.memoryUsage();
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(200).json({
+      status: 'ok',
+      service: 'moviejournal-cloudrun',
+      uptimeSec: Math.round(process.uptime()),
+      memoryMb: Math.round((mem.rss / 1024 / 1024) * 10) / 10,
+      l1Entries: l1RegionalCache.size,
+      activeKeyPoolSize: tmdbKeyPool.size,
+    });
   });
 
   // --- 1. Server Capability Status ---
@@ -1595,6 +1864,7 @@ async function startServer() {
       hasServerTmdbKey: hasAnyServerTmdbKey(),
       hasAiAvailable: Boolean(process.env.GEMINI_API_KEY),
       activeKeyPoolSize: tmdbKeyPool.size,
+      quotaGuard: getDailyCloudQuotaSnapshot(),
     });
   });
 
@@ -1888,7 +2158,7 @@ async function startServer() {
     const pollSecret = String(req.query.pollSecret || '').trim();
 
     const session = tvPairingSessions.get(sessionId);
-    if (!session || session.pollSecret !== pollSecret) {
+    if (!session || !timingSafeEqualStrings(session.pollSecret, pollSecret)) {
       res.status(404).json({ status: 'expired' });
       return;
     }
@@ -1987,20 +2257,11 @@ async function startServer() {
     });
   });
 
-  // --- 2C. Production Multi-Device User Cloud Sync Vault (Cross-Device Account Sync) ---
+  // --- 2C. Production Multi-Device User Cloud Sync Vault (AES-256-GCM Encrypted At Rest) ---
   interface ServerUserSyncRecord {
     uid: string;
     profile?: Record<string, any>;
-    library?: {
-      watchlist?: any[];
-      removedWatchlistKeys?: Record<string, number>;
-      watchedMovies?: number[];
-      removedMovies?: Record<string, number>;
-      manuallyWatchedShows?: number[];
-      removedShows?: Record<string, number>;
-      watchedEpisodes?: Record<string, number[]>;
-      updatedAt?: string;
-    };
+    library?: SyncUserLibraryState;
     updatedAt: number;
   }
 
@@ -2008,7 +2269,17 @@ async function startServer() {
   try {
     if (fs.existsSync(USER_SYNC_VAULT_FILE)) {
       const rawSync = JSON.parse(fs.readFileSync(USER_SYNC_VAULT_FILE, 'utf-8'));
-      if (Array.isArray(rawSync)) {
+      if (typeof rawSync?.encryptedPayload === 'string') {
+        const dec = decryptFromServerVault(rawSync.encryptedPayload);
+        if (dec) {
+          const parsedList = JSON.parse(dec);
+          if (Array.isArray(parsedList)) {
+            for (const item of parsedList) {
+              if (item?.uid) serverUserSyncVault.set(String(item.uid), item);
+            }
+          }
+        }
+      } else if (Array.isArray(rawSync)) {
         for (const item of rawSync) {
           if (item?.uid) serverUserSyncVault.set(String(item.uid), item);
         }
@@ -2020,20 +2291,20 @@ async function startServer() {
 
   function persistServerUserSyncVault(): void {
     try {
+      const plainJson = JSON.stringify(Array.from(serverUserSyncVault.values()));
+      const encryptedPayload = encryptForServerVault(plainJson);
       fs.writeFileSync(
         USER_SYNC_VAULT_FILE,
-        JSON.stringify(Array.from(serverUserSyncVault.values())),
+        JSON.stringify({
+          encryptedPayload,
+          userCount: serverUserSyncVault.size,
+          updatedAt: Date.now(),
+        }),
         'utf-8'
       );
     } catch {
       // ignore
     }
-  }
-
-  function getSyncItemMediaKey(item: any): string {
-    if (!item || !item.id) return '';
-    const mType = item.media_type === 'tv' || (!item.title && item.name) ? 'tv' : 'movie';
-    return `${mType}_${Math.abs(Math.floor(Number(item.id)))}`;
   }
 
   app.get('/api/user-sync/state', async (req, res) => {
@@ -2042,10 +2313,37 @@ async function startServer() {
       res.status(401).json({ error: 'Unauthorized' });
       return;
     }
-    const existing = serverUserSyncVault.get(user.uid) || {
+    let existing = serverUserSyncVault.get(user.uid) || {
       uid: user.uid,
       updatedAt: 0,
     };
+
+    // Bridge with shared Firestore userLibraryVault so Preview (ais-dev) & Shared (ais-pre) containers stay 100% in sync
+    if (firestoreDb && !serverFirestoreQuotaExhausted && canUseServerFirestoreRead(1)) {
+      try {
+        const snap = await getDoc(doc(firestoreDb, 'userLibraryVault', user.uid));
+        if (snap.exists()) {
+          const data = snap.data();
+          if (data?.libraryJson && typeof data.libraryJson === 'string') {
+            const parsedVaultLib = JSON.parse(data.libraryJson);
+            const mergedLib = mergeUserSyncLibraryState(existing.library || {}, parsedVaultLib);
+            existing = {
+              ...existing,
+              library: mergedLib,
+              updatedAt: Math.max(
+                existing.updatedAt || 0,
+                Number(data.updatedAtMs || data.updatedAt) || Date.now()
+              ),
+            };
+            serverUserSyncVault.set(user.uid, existing);
+          }
+        }
+      } catch (e) {
+        handleServerFirestoreQuotaError(e);
+      }
+    }
+
+    res.setHeader('Cache-Control', 'no-store');
     res.json(existing);
   });
 
@@ -2067,104 +2365,7 @@ async function startServer() {
     let nextLibrary = current.library || {};
     const incomingLib = req.body?.library;
     if (incomingLib && typeof incomingLib === 'object') {
-      const replaceAll = Boolean(incomingLib.replaceAll);
-      if (replaceAll) {
-        nextLibrary = {
-          watchlist: Array.isArray(incomingLib.watchlist) ? incomingLib.watchlist.slice(0, 500) : [],
-          removedWatchlistKeys: incomingLib.removedWatchlistKeys || {},
-          watchedMovies: Array.isArray(incomingLib.watchedMovies)
-            ? incomingLib.watchedMovies.slice(0, 500)
-            : [],
-          removedMovies: incomingLib.removedMovies || {},
-          manuallyWatchedShows: Array.isArray(incomingLib.manuallyWatchedShows)
-            ? incomingLib.manuallyWatchedShows.slice(0, 500)
-            : [],
-          removedShows: incomingLib.removedShows || {},
-          watchedEpisodes:
-            incomingLib.watchedEpisodes && typeof incomingLib.watchedEpisodes === 'object'
-              ? incomingLib.watchedEpisodes
-              : {},
-          updatedAt: new Date().toISOString(),
-        };
-      } else {
-        // Merge tombstones first
-        const mergedRemovedWatchlist: Record<string, number> = {
-          ...(nextLibrary.removedWatchlistKeys || {}),
-          ...(incomingLib.removedWatchlistKeys || {}),
-        };
-        const mergedRemovedMovies: Record<string, number> = {
-          ...(nextLibrary.removedMovies || {}),
-          ...(incomingLib.removedMovies || {}),
-        };
-        const mergedRemovedShows: Record<string, number> = {
-          ...(nextLibrary.removedShows || {}),
-          ...(incomingLib.removedShows || {}),
-        };
-
-        // Union watchlist items while respecting explicit removals
-        const wlMap = new Map<string, any>();
-        for (const item of nextLibrary.watchlist || []) {
-          const k = getSyncItemMediaKey(item);
-          if (k && !mergedRemovedWatchlist[k]) wlMap.set(k, item);
-        }
-        for (const item of incomingLib.watchlist || []) {
-          const k = getSyncItemMediaKey(item);
-          if (!k) continue;
-          const addedAt = Number(item._addedAtMs || 0);
-          const removedAt = Number(mergedRemovedWatchlist[k] || 0);
-          if (removedAt > 0 && addedAt > removedAt) {
-            delete mergedRemovedWatchlist[k];
-            wlMap.set(k, item);
-          } else if (!mergedRemovedWatchlist[k]) {
-            wlMap.set(k, item);
-          }
-        }
-
-        // Union watchedMovies while respecting explicit removals
-        const movieSet = new Set<number>(nextLibrary.watchedMovies || []);
-        for (const mId of incomingLib.watchedMovies || []) {
-          const numId = Number(mId);
-          if (Number.isFinite(numId) && numId > 0) movieSet.add(numId);
-        }
-        for (const [mKey, remTs] of Object.entries(mergedRemovedMovies)) {
-          if (remTs > 0) movieSet.delete(Number(mKey));
-        }
-
-        // Union manuallyWatchedShows
-        const showSet = new Set<number>(nextLibrary.manuallyWatchedShows || []);
-        for (const sId of incomingLib.manuallyWatchedShows || []) {
-          const numId = Number(sId);
-          if (Number.isFinite(numId) && numId > 0) showSet.add(numId);
-        }
-        for (const [sKey, remTs] of Object.entries(mergedRemovedShows)) {
-          if (remTs > 0) showSet.delete(Number(sKey));
-        }
-
-        // Merge watchedEpisodes per show
-        const mergedEpisodes: Record<string, number[]> = {
-          ...(nextLibrary.watchedEpisodes || {}),
-        };
-        if (incomingLib.watchedEpisodes && typeof incomingLib.watchedEpisodes === 'object') {
-          for (const [seriesId, eps] of Object.entries(incomingLib.watchedEpisodes)) {
-            if (Array.isArray(eps)) {
-              mergedEpisodes[seriesId] = Array.from(
-                new Set(eps.map(Number).filter((n) => Number.isFinite(n)))
-              );
-            }
-          }
-        }
-
-        nextLibrary = {
-          watchlist: Array.from(wlMap.values()).slice(0, 500),
-          removedWatchlistKeys: mergedRemovedWatchlist,
-          watchedMovies: Array.from(movieSet).slice(0, 500),
-          removedMovies: mergedRemovedMovies,
-          manuallyWatchedShows: Array.from(showSet).slice(0, 500),
-          removedShows: mergedRemovedShows,
-          watchedEpisodes: mergedEpisodes,
-          updatedAt: new Date().toISOString(),
-        };
-      }
+      nextLibrary = mergeUserSyncLibraryState(nextLibrary, incomingLib);
     }
 
     const updated: ServerUserSyncRecord = {
@@ -2175,7 +2376,42 @@ async function startServer() {
     };
     serverUserSyncVault.set(user.uid, updated);
     persistServerUserSyncVault();
+
+    // Mirror merged vault to shared Firestore userLibraryVault (1 atomic doc write)
+    if (firestoreDb && !serverFirestoreQuotaExhausted && canUseServerFirestoreWrite(1)) {
+      const serialized = JSON.stringify(nextLibrary);
+      if (Buffer.byteLength(serialized, 'utf-8') <= 780_000) {
+        const wlCount = Array.isArray(nextLibrary.watchlist) ? nextLibrary.watchlist.length : 0;
+        setDoc(doc(firestoreDb, 'userLibraryVault', user.uid), {
+          uid: user.uid,
+          libraryJson: serialized,
+          itemCount: Math.min(5000, wlCount),
+          updatedAtMs: updated.updatedAt,
+        }).catch((e) => handleServerFirestoreQuotaError(e));
+      }
+    }
+
     res.json({ ok: true, updatedAt: updated.updatedAt, library: nextLibrary });
+  });
+
+  app.post('/api/user-sync/delete-account', async (req, res) => {
+    const user = await verifyFirebaseIdToken(req.headers.authorization);
+    if (!user) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    serverUserSyncVault.delete(user.uid);
+    persistServerUserSyncVault();
+    localUserSecurityCache.delete(user.uid);
+    saveLocalUserSecurityCache();
+
+    if (firestoreDb && !serverFirestoreQuotaExhausted) {
+      await Promise.allSettled([
+        deleteDoc(doc(firestoreDb, 'userLibraryVault', user.uid)),
+        deleteDoc(doc(firestoreDb, 'userSecurityVault', user.uid)),
+      ]);
+    }
+    res.json({ ok: true });
   });
 
   // --- 2D. Official Hisense VIDAA DevKit (Code 27753790) Native TV App Manifest & Launch Endpoints ---
@@ -2275,12 +2511,16 @@ async function startServer() {
     res.redirect(302, '/?tv=1&vidaa=1');
   });
 
-  // --- 3. Multi-Key TMDB Pool Management Endpoints (Zero-Credential Client Policy) ---
+  // --- 3. Multi-Key TMDB Pool Management Endpoints (Restricted to Owner Only) ---
 
   app.get('/api/admin/tmdb-keys', async (req, res) => {
     const user = await verifyFirebaseIdToken(req.headers.authorization);
     if (!user) {
       res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    if (!isAuthorizedAdminOwner(user)) {
+      res.status(403).json({ error: 'Forbidden: Owner access required.' });
       return;
     }
 
@@ -2331,6 +2571,10 @@ async function startServer() {
     const user = await verifyFirebaseIdToken(req.headers.authorization);
     if (!user) {
       res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    if (!isAuthorizedAdminOwner(user)) {
+      res.status(403).json({ error: 'Forbidden: Owner access required.' });
       return;
     }
 
@@ -2394,6 +2638,10 @@ async function startServer() {
     const user = await verifyFirebaseIdToken(req.headers.authorization);
     if (!user) {
       res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    if (!isAuthorizedAdminOwner(user)) {
+      res.status(403).json({ error: 'Forbidden: Owner access required.' });
       return;
     }
 
@@ -2520,6 +2768,34 @@ async function startServer() {
 
       const result = await fetchTmdbThroughRegionalCache(endpoint, queryRecord, regionHeader);
       res.setHeader('X-Regional-Cache', result.fromCache ? 'HIT' : 'MISS');
+
+      if (result.status === 200 && result.data) {
+        const jsonStr = JSON.stringify(result.data);
+        const etag = computeWeakEtag(jsonStr);
+        res.setHeader('ETag', etag);
+        res.setHeader('Cache-Control', 'public, max-age=300, stale-while-revalidate=3600');
+        res.setHeader('Vary', 'Accept-Encoding, x-app-region');
+
+        const ifNoneMatch = String(req.headers['if-none-match'] || '').trim();
+        if (ifNoneMatch && ifNoneMatch === etag) {
+          res.status(304).end();
+          return;
+        }
+
+        const acceptEncoding = String(req.headers['accept-encoding'] || '');
+        if (acceptEncoding.includes('gzip') && jsonStr.length > 1024) {
+          const compressed = zlib.gzipSync(Buffer.from(jsonStr, 'utf-8'));
+          res.setHeader('Content-Encoding', 'gzip');
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.status(200).send(compressed);
+          return;
+        }
+
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.status(200).send(jsonStr);
+        return;
+      }
+
       res.status(result.status).json(result.data);
     } catch (error: any) {
       res.status(502).json({
@@ -2528,7 +2804,7 @@ async function startServer() {
     }
   });
 
-  // --- Server-Side Gemini AI: Movie & Series Insights ---
+  // --- Server-Side Gemini AI: Movie & Series Insights (Protected by Daily Quota Guard & Input Validation) ---
   app.post('/api/ai/insights', async (req, res) => {
     const ai = getAiClient();
     if (!ai) {
@@ -2539,28 +2815,37 @@ async function startServer() {
     }
 
     const { title, overview, releaseYear, genres, rating, query: userQuery, language } = req.body || {};
-    if (!title) {
+    const safeTitle = String(title || '').trim().slice(0, 200);
+    if (!safeTitle) {
       res.status(400).json({ error: 'Missing media title.' });
       return;
     }
+    if (!canUseServerAiCall()) {
+      res.status(429).json({
+        error: 'Daily free AI insight quota reached to protect your Cloud credit budget.',
+      });
+      return;
+    }
 
+    const safeQuery = userQuery ? String(userQuery).trim().slice(0, 600) : '';
+    const safeOverview = overview ? String(overview).trim().slice(0, 1200) : '';
     const langHint =
       language && String(language).startsWith('de')
         ? 'Antworte auf Deutsch, präzise, cineastisch und ohne Spoiler.'
         : 'Respond in the same language as the user question (or English by default), concisely and without spoilers.';
 
     const contextBlock = [
-      `Title: "${title}"`,
-      releaseYear ? `Year: ${releaseYear}` : null,
-      genres?.length ? `Genres: ${genres.join(', ')}` : null,
-      rating ? `TMDB Rating: ${rating}/10` : null,
-      overview ? `Synopsis: ${overview}` : null,
+      `Title: "${safeTitle}"`,
+      releaseYear ? `Year: ${String(releaseYear).slice(0, 10)}` : null,
+      Array.isArray(genres) && genres.length ? `Genres: ${genres.slice(0, 8).join(', ')}` : null,
+      rating ? `TMDB Rating: ${Number(rating).toFixed(1)}/10` : null,
+      safeOverview ? `Synopsis: ${safeOverview}` : null,
     ]
       .filter(Boolean)
       .join(' | ');
 
-    const promptText = userQuery
-      ? `Context: ${contextBlock}\n\nUser Question: "${userQuery}"\nProvide a sharp, insightful answer in 2-4 sentences.`
+    const promptText = safeQuery
+      ? `Context: ${contextBlock}\n\nUser Question: "${safeQuery}"\nProvide a sharp, insightful answer in 2-4 sentences.`
       : `Context: ${contextBlock}\n\nProvide a compelling "Why Watch This" critique in under 60 words highlighting its tone, direction, and appeal.`;
 
     try {
@@ -2581,7 +2866,7 @@ async function startServer() {
     }
   });
 
-  // --- Server-Side Gemini AI: Multi-Turn Film Expert Chat ---
+  // --- Server-Side Gemini AI: Multi-Turn Film Expert Chat (Protected by Daily Quota Guard & Input Validation) ---
   app.post('/api/ai/chat', async (req, res) => {
     const ai = getAiClient();
     if (!ai) {
@@ -2592,8 +2877,15 @@ async function startServer() {
     }
 
     const { history = [], message, mediaContext, language } = req.body || {};
-    if (!message) {
+    const safeMessage = String(message || '').trim().slice(0, 800);
+    if (!safeMessage) {
       res.status(400).json({ error: 'Missing chat message.' });
+      return;
+    }
+    if (!canUseServerAiCall()) {
+      res.status(429).json({
+        error: 'Daily free AI chat quota reached to protect your Cloud credit budget.',
+      });
       return;
     }
 
@@ -2605,14 +2897,17 @@ async function startServer() {
     const conversationLog = Array.isArray(history)
       ? history
           .slice(-8)
-          .map((h: any) => `${h.role === 'user' ? 'User' : 'Critic'}: ${h.text}`)
+          .map(
+            (h: any) =>
+              `${h?.role === 'user' ? 'User' : 'Critic'}: ${String(h?.text || '').slice(0, 600)}`
+          )
           .join('\n')
       : '';
 
     const fullPrompt = [
-      mediaContext ? `Current Title Context: ${mediaContext}` : null,
+      mediaContext ? `Current Title Context: ${String(mediaContext).slice(0, 600)}` : null,
       conversationLog ? `Conversation History:\n${conversationLog}` : null,
-      `User: ${message}`,
+      `User: ${safeMessage}`,
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -2667,7 +2962,13 @@ async function startServer() {
   const distPath = path.join(__dirname, 'dist');
   const distAssetsPath = path.join(distPath, 'assets');
   if (fs.existsSync(distAssetsPath)) {
-    app.use('/assets', express.static(distAssetsPath));
+    app.use(
+      '/assets',
+      express.static(distAssetsPath, {
+        maxAge: '365d',
+        immutable: true,
+      })
+    );
   }
 
   if (process.env.NODE_ENV !== 'production') {
@@ -2678,19 +2979,175 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(distPath));
+    app.use(express.static(distPath, { maxAge: '1h' }));
     app.use((_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`MovieJournal server listening on http://0.0.0.0:${PORT}`);
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    logStructured('INFO', `MovieJournal server listening on http://0.0.0.0:${PORT}`, {
+      port: PORT,
+      env: process.env.NODE_ENV || 'development',
+    });
     hydrateKeyPoolFromFirestoreVault().then(() => {
       startFirestoreProxyBridge();
       warmRegionCatalogue('DE', 'de-DE').catch(() => {});
     });
   });
+
+  const gracefulShutdown = (signal: string) => {
+    logStructured('INFO', `Received ${signal}, flushing caches and shutting down gracefully...`);
+    try {
+      persistServerUserSyncVault();
+    } catch {
+      // ignore
+    }
+    server.close(() => {
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+
+  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.once('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
-startServer();
+export interface SyncUserLibraryState {
+  watchlist?: any[];
+  removedWatchlistKeys?: Record<string, number>;
+  watchedMovies?: number[];
+  removedMovies?: Record<string, number>;
+  manuallyWatchedShows?: number[];
+  removedShows?: Record<string, number>;
+  watchedEpisodes?: Record<string, number[]>;
+  updatedAt?: string;
+  replaceAll?: boolean;
+}
+
+export function getSyncItemMediaKey(item: any): string {
+  if (!item || !item.id) return '';
+  const numId = Math.abs(Math.floor(Number(item.id)));
+  if (!Number.isFinite(numId) || numId <= 0) return '';
+  const mType = item.media_type === 'tv' || (!item.title && item.name) ? 'tv' : 'movie';
+  return `${mType}_${numId}`;
+}
+
+export function mergeUserSyncLibraryState(
+  currentLib: SyncUserLibraryState = {},
+  incomingLib: SyncUserLibraryState = {}
+): SyncUserLibraryState {
+  if (Boolean(incomingLib.replaceAll)) {
+    return {
+      watchlist: Array.isArray(incomingLib.watchlist) ? incomingLib.watchlist.slice(0, 500) : [],
+      removedWatchlistKeys: incomingLib.removedWatchlistKeys || {},
+      watchedMovies: Array.isArray(incomingLib.watchedMovies)
+        ? incomingLib.watchedMovies.slice(0, 500)
+        : [],
+      removedMovies: incomingLib.removedMovies || {},
+      manuallyWatchedShows: Array.isArray(incomingLib.manuallyWatchedShows)
+        ? incomingLib.manuallyWatchedShows.slice(0, 500)
+        : [],
+      removedShows: incomingLib.removedShows || {},
+      watchedEpisodes:
+        incomingLib.watchedEpisodes && typeof incomingLib.watchedEpisodes === 'object'
+          ? incomingLib.watchedEpisodes
+          : {},
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  // Merge tombstones first (latest timestamp wins)
+  const mergedRemovedWatchlist: Record<string, number> = {
+    ...(currentLib.removedWatchlistKeys || {}),
+  };
+  for (const [k, ts] of Object.entries(incomingLib.removedWatchlistKeys || {})) {
+    const numTs = Number(ts || 0);
+    if (numTs > (mergedRemovedWatchlist[k] || 0)) {
+      mergedRemovedWatchlist[k] = numTs;
+    }
+  }
+
+  const mergedRemovedMovies: Record<string, number> = {
+    ...(currentLib.removedMovies || {}),
+    ...(incomingLib.removedMovies || {}),
+  };
+  const mergedRemovedShows: Record<string, number> = {
+    ...(currentLib.removedShows || {}),
+    ...(incomingLib.removedShows || {}),
+  };
+
+  // Union watchlist items while respecting explicit removals
+  const wlMap = new Map<string, any>();
+  for (const item of currentLib.watchlist || []) {
+    const k = getSyncItemMediaKey(item);
+    if (k && !mergedRemovedWatchlist[k]) wlMap.set(k, item);
+  }
+  for (const item of incomingLib.watchlist || []) {
+    const k = getSyncItemMediaKey(item);
+    if (!k) continue;
+    const addedAt = Number(item._addedAtMs || 0);
+    const removedAt = Number(mergedRemovedWatchlist[k] || 0);
+    if (removedAt > 0 && addedAt > removedAt) {
+      delete mergedRemovedWatchlist[k];
+      wlMap.set(k, item);
+    } else if (!mergedRemovedWatchlist[k]) {
+      wlMap.set(k, item);
+    }
+  }
+
+  // Union watchedMovies while respecting explicit removals
+  const movieSet = new Set<number>(currentLib.watchedMovies || []);
+  for (const mId of incomingLib.watchedMovies || []) {
+    const numId = Number(mId);
+    if (Number.isFinite(numId) && numId > 0) movieSet.add(numId);
+  }
+  for (const [mKey, remTs] of Object.entries(mergedRemovedMovies)) {
+    if (Number(remTs) > 0) movieSet.delete(Number(mKey));
+  }
+
+  // Union manuallyWatchedShows while respecting explicit removals
+  const showSet = new Set<number>(currentLib.manuallyWatchedShows || []);
+  for (const sId of incomingLib.manuallyWatchedShows || []) {
+    const numId = Number(sId);
+    if (Number.isFinite(numId) && numId > 0) showSet.add(numId);
+  }
+  for (const [sKey, remTs] of Object.entries(mergedRemovedShows)) {
+    if (Number(remTs) > 0) showSet.delete(Number(sKey));
+  }
+
+  // Union watchedEpisodes per show across devices
+  const mergedEpisodes: Record<string, number[]> = {};
+  for (const [seriesId, eps] of Object.entries(currentLib.watchedEpisodes || {})) {
+    if (Array.isArray(eps)) {
+      mergedEpisodes[seriesId] = Array.from(
+        new Set(eps.map(Number).filter((n) => Number.isFinite(n) && n > 0))
+      );
+    }
+  }
+  if (incomingLib.watchedEpisodes && typeof incomingLib.watchedEpisodes === 'object') {
+    for (const [seriesId, eps] of Object.entries(incomingLib.watchedEpisodes)) {
+      if (Array.isArray(eps)) {
+        const existingEps = mergedEpisodes[seriesId] || [];
+        mergedEpisodes[seriesId] = Array.from(
+          new Set([...existingEps, ...eps.map(Number).filter((n) => Number.isFinite(n) && n > 0)])
+        );
+      }
+    }
+  }
+
+  return {
+    watchlist: Array.from(wlMap.values()).slice(0, 500),
+    removedWatchlistKeys: mergedRemovedWatchlist,
+    watchedMovies: Array.from(movieSet).slice(0, 500),
+    removedMovies: mergedRemovedMovies,
+    manuallyWatchedShows: Array.from(showSet).slice(0, 500),
+    removedShows: mergedRemovedShows,
+    watchedEpisodes: mergedEpisodes,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+if (process.env.MOVIEJOURNAL_TEST_MODE !== '1') {
+  startServer();
+}

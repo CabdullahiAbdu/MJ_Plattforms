@@ -481,6 +481,40 @@
         "backupCodeHashesJson",
         "updatedAt"
       ]
+    },
+    "UserLibraryVaultEntry": {
+      "title": "UserLibraryVaultEntry",
+      "description": "Atomic 1-document multi-device library snapshot storing compact watchlist, watched movies, watched shows, episode progress, and deletion tombstones for instant cross-device sync.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Owner Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "libraryJson": {
+          "type": "string",
+          "description": "Serialized JSON payload containing watchlist, watchedMovies, manuallyWatchedShows, watchedEpisodes, and deletion tombstones.",
+          "minLength": 2,
+          "maxLength": 900000
+        },
+        "itemCount": {
+          "type": "number",
+          "description": "Number of watchlist items in this snapshot (0 to 5000)."
+        },
+        "updatedAtMs": {
+          "type": "number",
+          "description": "Last update epoch timestamp in milliseconds."
+        }
+      },
+      "required": [
+        "uid",
+        "libraryJson",
+        "itemCount",
+        "updatedAtMs"
+      ]
     }
   },
   "firestore": {
@@ -495,6 +529,10 @@
     "/users/{userId}/progress/{mediaKey}": {
       "schema": { "$ref": "#/entities/WatchProgress" },
       "description": "Subcollection storing a user's watched movies and series episode progress."
+    },
+    "/userLibraryVault/{userId}": {
+      "schema": { "$ref": "#/entities/UserLibraryVaultEntry" },
+      "description": "Atomic 1-document library sync vault shared across all devices and URLs."
     },
     "/regionRegistry/{regionLangId}": {
       "schema": { "$ref": "#/entities/RegionRegistryEntry" },

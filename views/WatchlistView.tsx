@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback, memo } from 'react';
 import {
   MediaItem,
   AppView,
@@ -21,6 +21,10 @@ import { TmdbService } from '../services/tmdb';
 import { useAmbientActions } from '../context/AmbientContext';
 import { SafeImage } from '../components/SafeImage';
 import { MediaCard } from '../components/MovieCard';
+import {
+  getOptimalCardPosterSize,
+  getMaxParallelRequests,
+} from '../services/performanceMonitor';
 
 interface WatchlistViewProps {
   watchlist: MediaItem[];
@@ -48,7 +52,7 @@ interface WatchlistRailProps {
   getBottomBadge: (item: MediaItem) => { text?: string; color?: 'default' | 'blue' };
 }
 
-const WatchlistRail: React.FC<WatchlistRailProps> = ({
+const WatchlistRailComponent: React.FC<WatchlistRailProps> = ({
   title,
   subtitle,
   items,
@@ -59,8 +63,24 @@ const WatchlistRail: React.FC<WatchlistRailProps> = ({
   getBottomBadge,
 }) => {
   const rowRef = useRef<HTMLDivElement>(null);
+  const [renderLimit, setRenderLimit] = useState<number>(24);
+
+  useEffect(() => {
+    setRenderLimit(24);
+  }, [title, items.length]);
 
   if (items.length === 0) return null;
+
+  const visibleItems = items.slice(0, renderLimit);
+  const optimalPosterSize = getOptimalCardPosterSize('poster');
+
+  const handleRailScroll = () => {
+    const el = rowRef.current;
+    if (!el || renderLimit >= items.length) return;
+    if (el.scrollLeft + el.clientWidth >= el.scrollWidth - 420) {
+      setRenderLimit((prev) => Math.min(items.length, prev + 24));
+    }
+  };
 
   const scroll = (direction: 'left' | 'right') => {
     if (rowRef.current) {
@@ -81,9 +101,6 @@ const WatchlistRail: React.FC<WatchlistRailProps> = ({
               {items.length}
             </span>
           </h2>
-          <p className="text-zinc-400 font-normal text-[clamp(0.7rem,2vw,0.85rem)] mt-0.5">
-            {subtitle}
-          </p>
         </div>
 
         {/* Desktop Scroll Arrows */}
@@ -91,6 +108,8 @@ const WatchlistRail: React.FC<WatchlistRailProps> = ({
           <div className="hidden md:flex items-center gap-2 opacity-0 group-hover/row:opacity-100 transition-opacity duration-200">
             <button
               type="button"
+              tabIndex={-1}
+              data-tv-ignore="true"
               onClick={() => scroll('left')}
               aria-label="Scroll left"
               className="min-w-[38px] min-h-[38px] flex items-center justify-center rounded-full bg-white/5 hover:bg-white/20 backdrop-blur-sm transition-all active:scale-95"
@@ -99,6 +118,8 @@ const WatchlistRail: React.FC<WatchlistRailProps> = ({
             </button>
             <button
               type="button"
+              tabIndex={-1}
+              data-tv-ignore="true"
               onClick={() => scroll('right')}
               aria-label="Scroll right"
               className="min-w-[38px] min-h-[38px] flex items-center justify-center rounded-full bg-white/5 hover:bg-white/20 backdrop-blur-sm transition-all active:scale-95"
@@ -109,20 +130,30 @@ const WatchlistRail: React.FC<WatchlistRailProps> = ({
         )}
       </div>
 
-      {/* Horizontal Cinema Rail (60fps iOS momentum scroll) */}
+      {/* Horizontal Cinema Rail (60fps iOS momentum scroll + progressive DOM windowing) */}
       <div
         ref={rowRef}
+        data-tv-row="true"
+        onScroll={handleRailScroll}
         className="relative z-10 flex overflow-x-auto overflow-y-hidden gap-[clamp(0.65rem,2.4vw,1.1rem)] px-[var(--fluid-page-px)] pb-4 pt-1 no-scrollbar ios-touch-rail items-stretch"
       >
-        {items.map((item, idx) => {
+        {visibleItems.map((item, idx) => {
           const badge = getBottomBadge(item);
           return (
-            <div key={`${resolveMediaType(item)}-${item.id}-${idx}`} className="flex-shrink-0">
+            <div
+              key={`${resolveMediaType(item)}-${item.id}-${idx}`}
+              className="flex-shrink-0"
+              onFocus={() => {
+                if (idx >= renderLimit - 4 && renderLimit < items.length) {
+                  setRenderLimit((prev) => Math.min(items.length, prev + 24));
+                }
+              }}
+            >
               <MediaCard
                 item={item}
                 imageUrl={tmdb.getImageUrl(
                   item.poster_path || item.backdrop_path,
-                  'w500'
+                  optimalPosterSize
                 )}
                 onClick={onCardClick}
                 variant="poster"
@@ -140,6 +171,8 @@ const WatchlistRail: React.FC<WatchlistRailProps> = ({
     </div>
   );
 };
+
+const WatchlistRail = memo(WatchlistRailComponent);
 
 export const WatchlistView: React.FC<WatchlistViewProps> = ({
   watchlist,
@@ -160,7 +193,7 @@ export const WatchlistView: React.FC<WatchlistViewProps> = ({
 
   const isDe = tmdb.getLanguage().toLowerCase().startsWith('de');
 
-  // Hydrate TV show episode counts for accurate progress bars and badges
+  // Hydrate TV show episode counts for accurate progress bars and badges (bounded by device concurrency)
   useEffect(() => {
     let cancelled = false;
     const tvItems = watchlist.filter((item) => resolveMediaType(item) === 'tv');
@@ -168,8 +201,9 @@ export const WatchlistView: React.FC<WatchlistViewProps> = ({
 
     if (missingIds.length === 0) return;
 
+    const batchLimit = Math.min(8, getMaxParallelRequests() * 2);
     Promise.all(
-      missingIds.slice(0, 20).map((id) =>
+      missingIds.slice(0, batchLimit).map((id) =>
         tmdb
           .getTvDetails(id)
           .then((detail) => ({ id, detail }))
@@ -379,9 +413,6 @@ export const WatchlistView: React.FC<WatchlistViewProps> = ({
       {/* Header Bar with Apple-TV Segmented Filter & Search */}
       <div className="px-[var(--fluid-page-px)] flex flex-col sm:flex-row sm:items-end justify-between gap-4 mb-5 sm:mb-7">
         <div>
-          <span className="text-[clamp(0.65rem,1.8vw,0.72rem)] font-bold uppercase tracking-[0.2em] text-accent block mb-1">
-            {isDe ? 'Persönliches Programm' : 'Personal Cinema'}
-          </span>
           <h1 className="text-[length:var(--fluid-h1)] font-black tracking-tight text-white font-display leading-tight">
             {isDe ? 'Watchlist' : 'Watchlist'}
           </h1>
@@ -515,6 +546,7 @@ export const WatchlistView: React.FC<WatchlistViewProps> = ({
                   fallbackTitle={heroItem.title || heroItem.name}
                   className="absolute inset-0 w-full h-full object-cover object-top"
                   loading="eager"
+                  fetchPriority="high"
                 />
                 <div className="absolute inset-0 bg-gradient-to-t from-black via-black/50 to-transparent" />
                 <div className="absolute inset-0 bg-gradient-to-r from-black/85 via-black/35 to-transparent" />

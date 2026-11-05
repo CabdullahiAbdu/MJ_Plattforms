@@ -482,8 +482,8 @@ export const CalendarView: React.FC<CalendarViewProps> = ({ tmdb, watchlist, onE
         <div className="h-px bg-gradient-to-r from-transparent via-white/20 to-transparent flex-1" />
         <div className="flex flex-col items-center relative group">
           {isToday && (
-            <span className="absolute -top-5 text-[10px] font-black uppercase tracking-[0.3em] text-accent animate-pulse">
-              Today
+            <span className="absolute -top-5 text-[10px] font-black uppercase tracking-[0.3em] text-accent">
+              {languageCode.startsWith('de') ? 'Heute' : 'Today'}
             </span>
           )}
           <div
@@ -525,13 +525,11 @@ export const CalendarView: React.FC<CalendarViewProps> = ({ tmdb, watchlist, onE
       {airingToday.length > 0 && (
         <div className="max-w-5xl mx-auto mt-2 mb-6">
           <div className="flex items-center justify-between mb-3 px-1">
-            <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-              <h3 className="text-sm sm:text-base font-black uppercase tracking-wider text-white">
-                Heute mit neuer Episode
-              </h3>
-            </div>
-            <span className="text-[11px] font-semibold text-zinc-400">Live TV & Stream</span>
+            <h3 className="text-sm sm:text-base font-black tracking-tight text-white">
+              {languageCode.startsWith('de')
+                ? 'Heute mit neuer Episode'
+                : 'New Episodes Airing Today'}
+            </h3>
           </div>
           <div className="flex overflow-x-auto gap-3 pb-2 no-scrollbar ios-touch-rail ios-snap-rail">
             {airingToday.map((item) => (
@@ -555,7 +553,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({ tmdb, watchlist, onE
                 />
                 <div className="absolute inset-0 bg-gradient-to-t from-black/95 via-black/35 to-transparent flex flex-col justify-end p-3">
                   <span className="text-[9px] font-black uppercase tracking-widest text-emerald-400 mb-0.5">
-                    Heute neue Folge
+                    {languageCode.startsWith('de') ? 'Heute neue Folge' : 'New Episode Today'}
                   </span>
                   <h4 className="text-white font-bold text-xs sm:text-sm leading-tight line-clamp-1">
                     {item.name || item.title}
@@ -573,11 +571,15 @@ export const CalendarView: React.FC<CalendarViewProps> = ({ tmdb, watchlist, onE
           <div className="w-9 h-9 border-3 border-white border-t-transparent rounded-full animate-spin" />
         </div>
       ) : sortedDates.length === 0 ? (
-        <div className="flex flex-col items-center justify-center h-[42vh] opacity-35 text-center">
+        <div className="flex flex-col items-center justify-center h-[42vh] opacity-45 text-center">
           <CalIcon size={44} className="mb-3 text-zinc-500" />
-          <h3 className="text-[length:var(--fluid-h2)] font-bold text-white">Quiet Month</h3>
+          <h3 className="text-[length:var(--fluid-h2)] font-bold text-white">
+            {languageCode.startsWith('de') ? 'Ruhiger Monat' : 'Quiet Month'}
+          </h3>
           <p className="text-zinc-500 text-[length:var(--fluid-body)]">
-            No major releases found for this month.
+            {languageCode.startsWith('de')
+              ? 'Keine großen Neustarts für diesen Monat gefunden.'
+              : 'No major releases found for this month.'}
           </p>
         </div>
       ) : (

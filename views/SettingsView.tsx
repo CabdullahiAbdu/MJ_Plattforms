@@ -19,7 +19,10 @@ import {
   Key,
   Copy,
   RefreshCw,
-  Plus,
+  Zap,
+  Wifi,
+  Play,
+  Info,
 } from '../components/Icons';
 import { SafeImage } from '../components/SafeImage';
 import {
@@ -29,13 +32,11 @@ import {
   enableTwoFactor,
   disableTwoFactor,
   TwoFactorSetupResponse,
-  fetchTmdbKeyPoolStatus,
-  addTmdbKeysToServerPool,
-  removeTmdbKeyFromServerPool,
-  ServerKeyPoolStatus,
   approveTvPairingSession,
+  deleteUserAccountAndCloudData,
 } from '../services/firebase';
-import { ServerCacheStats, TvModePreference } from '../context/ConfigContext';
+import { TvModePreference } from '../context/ConfigContext';
+import { haptics } from '../services/haptics';
 
 interface SettingsViewProps {
   tmdb: TmdbService;
@@ -43,7 +44,6 @@ interface SettingsViewProps {
   setLanguage: (lang: string) => void;
   currentRegion: string;
   setRegion: (reg: string) => void;
-  onClearApiCache: () => void;
   onResetLibrary: () => void;
   onExportLibrary: () => string;
   onImportLibrary: (rawJson: string) => { ok: boolean; count: number; error?: string };
@@ -65,11 +65,6 @@ interface SettingsViewProps {
   isCloudSynced: boolean;
   openAuthModal: () => void;
   logoutUser: () => Promise<void>;
-  replayIntro: () => void;
-  triggerFullTestFlow: () => void;
-  onReopenOnboarding: () => void;
-  serverCacheStats: ServerCacheStats | null;
-  refreshServerStats: () => void;
 }
 
 const LANGUAGES = [
@@ -115,7 +110,20 @@ const FALLBACK_PROVIDERS: WatchProvider[] = [
   { provider_id: 11, provider_name: 'MUBI', logo_path: '/fj9Y8iIMFUC6952HwxbGixTQPb7.jpg', display_priority: 10 },
 ];
 
-type SheetType = 'providers' | 'region' | 'language' | 'twoFactor' | 'keyPool' | 'tvPairing' | null;
+type SheetType =
+  | 'providers'
+  | 'region'
+  | 'language'
+  | 'twoFactor'
+  | 'tvPairing'
+  | 'legal'
+  | 'iosInstall'
+  | null;
+
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+}
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   tmdb,
@@ -131,6 +139,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   setTheme,
   userProviders,
   setUserProviders,
+  autoplay,
+  setAutoplay,
+  dataSaver,
+  setDataSaver,
+  includeAdult,
+  setIncludeAdult,
   tvMode,
   setTvMode,
   isTvMode,
@@ -143,7 +157,43 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [availableProviders, setAvailableProviders] = useState<WatchProvider[]>(FALLBACK_PROVIDERS);
   const [providerSearch, setProviderSearch] = useState('');
   const [confirmingReset, setConfirmingReset] = useState(false);
+  const [confirmingAccountDelete, setConfirmingAccountDelete] = useState(false);
+  const [deletingAccount, setDeletingAccount] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // PWA / Home Screen Install Prompt State
+  const [deferredInstallPrompt, setDeferredInstallPrompt] =
+    useState<BeforeInstallPromptEvent | null>(null);
+  const [isStandaloneApp, setIsStandaloneApp] = useState<boolean>(false);
+  const [isIosDevice, setIsIosDevice] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const standalone =
+      window.matchMedia('(display-mode: standalone)').matches ||
+      (window.navigator as any).standalone === true ||
+      window.location.protocol === 'capacitor:';
+    setIsStandaloneApp(standalone);
+
+    const ua = window.navigator.userAgent.toLowerCase();
+    setIsIosDevice(/iphone|ipad|ipod/.test(ua));
+
+    const onBeforeInstall = (e: Event) => {
+      e.preventDefault();
+      setDeferredInstallPrompt(e as BeforeInstallPromptEvent);
+    };
+    const onAppInstalled = () => {
+      setIsStandaloneApp(true);
+      setDeferredInstallPrompt(null);
+    };
+
+    window.addEventListener('beforeinstallprompt', onBeforeInstall);
+    window.addEventListener('appinstalled', onAppInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', onBeforeInstall);
+      window.removeEventListener('appinstalled', onAppInstalled);
+    };
+  }, []);
 
   // Two-Factor Auth (2FA) State
   const [twoFactorEnabled, setTwoFactorEnabled] = useState<boolean>(false);
@@ -152,12 +202,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [twoFactorCodeInput, setTwoFactorCodeInput] = useState<string>('');
   const [twoFactorBusy, setTwoFactorBusy] = useState<boolean>(false);
   const [twoFactorError, setTwoFactorError] = useState<string | null>(null);
-
-  // Multi-Key TMDB Failover Pool State
-  const [keyPoolStatus, setKeyPoolStatus] = useState<ServerKeyPoolStatus | null>(null);
-  const [newKeysInput, setNewKeysInput] = useState<string>('');
-  const [keyPoolBusy, setKeyPoolBusy] = useState<boolean>(false);
-  const [keyPoolError, setKeyPoolError] = useState<string | null>(null);
 
   // Smart TV 6-Digit Pairing State (for linking TV from iPhone)
   const [tvCodeInput, setTvCodeInput] = useState<string>('');
@@ -210,22 +254,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  const refreshSecurityAndPoolInfo = useCallback(async () => {
+  const refreshSecurityInfo = useCallback(async () => {
     if (!currentUser) return;
-    const [tfStatus, poolInfo] = await Promise.all([
-      getTwoFactorStatus(currentUser),
-      fetchTmdbKeyPoolStatus(),
-    ]);
+    const tfStatus = await getTwoFactorStatus(currentUser);
     setTwoFactorEnabled(tfStatus.twoFactorEnabled);
     setRemainingBackupCodes(tfStatus.remainingBackupCodes);
-    if (poolInfo) {
-      setKeyPoolStatus(poolInfo);
-    }
   }, [currentUser]);
 
   useEffect(() => {
-    refreshSecurityAndPoolInfo();
-  }, [refreshSecurityAndPoolInfo]);
+    refreshSecurityInfo();
+  }, [refreshSecurityInfo]);
 
   useEffect(() => {
     let active = true;
@@ -330,47 +368,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setTwoFactorError(err?.message || 'Error');
     } finally {
       setTwoFactorBusy(false);
-    }
-  };
-
-  const handleAddKeysToPool = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newKeysInput.trim()) return;
-    setKeyPoolError(null);
-    setKeyPoolBusy(true);
-    try {
-      const result = await addTmdbKeysToServerPool(newKeysInput);
-      setNewKeysInput('');
-      const updated = await fetchTmdbKeyPoolStatus();
-      if (updated) setKeyPoolStatus(updated);
-      onNotify(
-        isDe
-          ? `${result.addedCount} Schlüssel verschlüsselt in den Failover-Pool aufgenommen (${result.poolSize} aktiv)`
-          : `Added ${result.addedCount} keys to encrypted failover pool (${result.poolSize} active)`,
-        'success'
-      );
-    } catch (err: any) {
-      setKeyPoolError(
-        err?.message ||
-          (isDe ? 'Schlüssel konnten nicht hinzugefügt werden.' : 'Failed to add keys.')
-      );
-    } finally {
-      setKeyPoolBusy(false);
-    }
-  };
-
-  const handleRemoveKeyFromPool = async (keyId: string) => {
-    setKeyPoolError(null);
-    setKeyPoolBusy(true);
-    try {
-      await removeTmdbKeyFromServerPool(keyId);
-      const updated = await fetchTmdbKeyPoolStatus();
-      if (updated) setKeyPoolStatus(updated);
-      onNotify(isDe ? 'Schlüssel aus Pool entfernt' : 'Key removed from pool', 'info');
-    } catch (err: any) {
-      setKeyPoolError(err?.message || 'Failed to remove key');
-    } finally {
-      setKeyPoolBusy(false);
     }
   };
 
@@ -563,53 +560,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   {isDe ? 'Abgleichen' : 'Sync'}
                 </span>
               </button>
-
-              <a
-                href="https://console.firebase.google.com/project/gen-lang-client-0463426822/usage/details"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="w-full py-3.5 flex items-center justify-between gap-3 hover:opacity-80 active:opacity-60 transition-opacity text-left cursor-pointer"
-              >
-                <div className="flex items-center gap-3.5 min-w-0">
-                  <Globe size={18} className="text-zinc-400 shrink-0" />
-                  <div className="min-w-0">
-                    <div className="text-[clamp(0.925rem,2.2vw,1rem)] font-medium text-white truncate">
-                      {isDe
-                        ? 'Firebase Blaze-Plan & Cloud-Guthaben'
-                        : 'Firebase Blaze Plan & Cloud Billing'}
-                    </div>
-                    <div className="text-xs text-zinc-500 truncate mt-0.5">
-                      {isDe
-                        ? 'Tageslimit aufheben & Google Cloud Testguthaben verknüpfen'
-                        : 'Lift daily free quota & link Google Cloud trial credit'}
-                    </div>
-                  </div>
-                </div>
-                <div className="flex items-center gap-1.5 text-xs text-zinc-400 shrink-0">
-                  <span>Blaze</span>
-                  <ChevronRight size={16} className="text-zinc-600" />
-                </div>
-              </a>
             </div>
           )}
         </section>
 
-        {/* 2. SICHERHEIT & SERVER KEY-POOL (2FA + 5-10 Key Failover Pool) */}
+        {/* 2. KONTO-SICHERHEIT (2FA) */}
         {currentUser && (
           <section>
             <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 mb-2">
-              {isDe ? 'Sicherheit & Hochverfügbarkeit' : 'Security & High Availability'}
+              {isDe ? 'Konto-Sicherheit' : 'Account Security'}
             </h3>
 
             <div className="divide-y divide-white/[0.08] border-y border-white/[0.08]">
-              {/* Row 1: Zwei-Faktor-Authentifizierung (2FA) */}
+              {/* Zwei-Faktor-Authentifizierung (2FA) */}
               <button
                 type="button"
                 onClick={() => {
                   setTwoFactorError(null);
                   setTwoFactorSetupData(null);
                   setActiveSheet('twoFactor');
-                  refreshSecurityAndPoolInfo();
+                  refreshSecurityInfo();
                 }}
                 className="w-full py-4 flex items-center justify-between gap-3 hover:opacity-80 active:opacity-60 transition-opacity text-left"
               >
@@ -642,46 +612,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       : isDe
                       ? 'Aus'
                       : 'Off'}
-                  </span>
-                  <ChevronRight size={16} className="text-zinc-600" />
-                </div>
-              </button>
-
-              {/* Row 2: TMDB Multi-Key Failover Pool (5-10 Keys + 1,000-User Cache) */}
-              <button
-                type="button"
-                onClick={() => {
-                  setKeyPoolError(null);
-                  setActiveSheet('keyPool');
-                  refreshSecurityAndPoolInfo();
-                }}
-                className="w-full py-4 flex items-center justify-between gap-3 hover:opacity-80 active:opacity-60 transition-opacity text-left"
-              >
-                <div className="flex items-center gap-3.5 min-w-0">
-                  <Key size={18} className="text-zinc-400 shrink-0" />
-                  <div className="min-w-0">
-                    <div className="text-[clamp(0.925rem,2.2vw,1rem)] font-medium text-white truncate">
-                      {isDe
-                        ? 'TMDB Multi-Key Failover-Pool'
-                        : 'TMDB Multi-Key Failover Pool'}
-                    </div>
-                    <div className="text-xs text-zinc-500 truncate mt-0.5">
-                      {isDe
-                        ? 'Automatische Rotation & 1.000-User-Cache'
-                        : 'Automatic key rotation & 1,000-user cache'}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <span className="text-[clamp(0.85rem,2vw,0.925rem)] text-zinc-400 tabular-nums">
-                    {keyPoolStatus
-                      ? isDe
-                        ? `${keyPoolStatus.healthyCount}/${keyPoolStatus.poolSize} Keys`
-                        : `${keyPoolStatus.healthyCount}/${keyPoolStatus.poolSize} keys`
-                      : isDe
-                      ? 'Verwalten'
-                      : 'Manage'}
                   </span>
                   <ChevronRight size={16} className="text-zinc-600" />
                 </div>
@@ -787,13 +717,127 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </section>
 
+        {/* 4A. WIEDERGABE & DATENVERBRAUCH (Trailer-Autoplay, Datensparmodus, FSK 18+) */}
+        <section>
+          <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 mb-2">
+            {isDe ? 'Wiedergabe & Datenverbrauch' : 'Playback & Data Usage'}
+          </h3>
+
+          <div className="divide-y divide-white/[0.08] border-y border-white/[0.08]">
+            {/* Toggle 1: Trailer-Autoplay */}
+            <div className="py-3.5 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3.5 min-w-0">
+                <Play size={18} className="text-zinc-400 shrink-0" />
+                <div className="min-w-0">
+                  <div className="text-[clamp(0.925rem,2.2vw,1rem)] font-medium text-white truncate">
+                    {isDe ? 'Trailer automatisch abspielen' : 'Autoplay Trailers'}
+                  </div>
+                  <div className="text-xs text-zinc-500 truncate mt-0.5">
+                    {isDe
+                      ? 'Vorschau-Videos in der Detailansicht automatisch starten'
+                      : 'Automatically play video previews in detail views'}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={autoplay}
+                onClick={() => {
+                  haptics.selection();
+                  setAutoplay(!autoplay);
+                }}
+                className={`relative w-12 h-7 rounded-full transition-colors duration-200 shrink-0 ${
+                  autoplay ? 'bg-emerald-500' : 'bg-white/15'
+                }`}
+              >
+                <span
+                  className={`block w-5 h-5 rounded-full bg-white shadow-md transform transition-transform duration-200 ${
+                    autoplay ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {/* Toggle 2: Datensparmodus & 4G-Optimierung */}
+            <div className="py-3.5 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3.5 min-w-0">
+                <Wifi size={18} className="text-zinc-400 shrink-0" />
+                <div className="min-w-0">
+                  <div className="text-[clamp(0.925rem,2.2vw,1rem)] font-medium text-white truncate">
+                    {isDe ? 'Datensparmodus (4G & Akku)' : 'Data Saver (4G & Battery)'}
+                  </div>
+                  <div className="text-xs text-zinc-500 truncate mt-0.5">
+                    {isDe
+                      ? 'Kompaktere Bilder (w300) & reduzierte Hintergrund-Effekte'
+                      : 'Compact images (w300) & reduced background blur'}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={dataSaver}
+                onClick={() => {
+                  haptics.selection();
+                  setDataSaver(!dataSaver);
+                }}
+                className={`relative w-12 h-7 rounded-full transition-colors duration-200 shrink-0 ${
+                  dataSaver ? 'bg-emerald-500' : 'bg-white/15'
+                }`}
+              >
+                <span
+                  className={`block w-5 h-5 rounded-full bg-white shadow-md transform transition-transform duration-200 ${
+                    dataSaver ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {/* Toggle 3: FSK 18+ Inhalte */}
+            <div className="py-3.5 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3.5 min-w-0">
+                <Zap size={18} className="text-zinc-400 shrink-0" />
+                <div className="min-w-0">
+                  <div className="text-[clamp(0.925rem,2.2vw,1rem)] font-medium text-white truncate">
+                    {isDe ? 'Erwachseneninhalte (18+)' : 'Adult Content (18+)'}
+                  </div>
+                  <div className="text-xs text-zinc-500 truncate mt-0.5">
+                    {isDe
+                      ? 'Unzensierte FSK-18-Titel in den Suchergebnissen einschließen'
+                      : 'Include 18+ rated titles in search results'}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={includeAdult}
+                onClick={() => {
+                  haptics.selection();
+                  setIncludeAdult(!includeAdult);
+                }}
+                className={`relative w-12 h-7 rounded-full transition-colors duration-200 shrink-0 ${
+                  includeAdult ? 'bg-emerald-500' : 'bg-white/15'
+                }`}
+              >
+                <span
+                  className={`block w-5 h-5 rounded-full bg-white shadow-md transform transition-transform duration-200 ${
+                    includeAdult ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+          </div>
+        </section>
+
         {/* 4. ERSCHEINUNGSBILD */}
         <section>
           <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 mb-2">
             {isDe ? 'Erscheinungsbild' : 'Appearance'}
           </h3>
 
-          <div className="border-y border-white/[0.08]">
+          <div className="divide-y divide-white/[0.08] border-y border-white/[0.08]">
             <div className="py-4 flex items-center justify-between gap-3">
               <div className="flex items-center gap-3.5 min-w-0">
                 <Palette size={18} className="text-zinc-400 shrink-0" />
@@ -810,7 +854,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       key={t.id}
                       type="button"
                       aria-label={isDe ? t.nameDe : t.nameEn}
-                      onClick={() => setTheme(t.id)}
+                      onClick={() => {
+                        haptics.selection();
+                        setTheme(t.id);
+                      }}
                       style={{ backgroundColor: t.swatch }}
                       className={`w-6 h-6 rounded-full transition-transform flex items-center justify-center ${
                         active
@@ -824,6 +871,48 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 })}
               </div>
             </div>
+
+            {/* In-App PWA / Home-Screen Installation Row */}
+            {!isStandaloneApp && (deferredInstallPrompt || isIosDevice) && (
+              <button
+                type="button"
+                onClick={async () => {
+                  haptics.light();
+                  if (deferredInstallPrompt) {
+                    await deferredInstallPrompt.prompt();
+                    const choice = await deferredInstallPrompt.userChoice;
+                    if (choice.outcome === 'accepted') {
+                      setIsStandaloneApp(true);
+                      setDeferredInstallPrompt(null);
+                      onNotify(
+                        isDe ? 'App wird installiert…' : 'Installing app…',
+                        'success'
+                      );
+                    }
+                  } else {
+                    setActiveSheet('iosInstall');
+                  }
+                }}
+                className="w-full py-4 flex items-center justify-between gap-3 hover:opacity-80 active:opacity-60 transition-opacity text-left"
+              >
+                <div className="flex items-center gap-3.5 min-w-0">
+                  <Download size={18} className="text-zinc-400 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-[clamp(0.925rem,2.2vw,1rem)] font-medium text-white truncate">
+                      {isDe
+                        ? 'Als App auf Home-Bildschirm installieren'
+                        : 'Install App to Home Screen'}
+                    </div>
+                    <div className="text-xs text-zinc-500 truncate mt-0.5">
+                      {isDe
+                        ? 'Vollbild-App ohne Browser-Leiste für iPhone, Android & Mac'
+                        : 'Full-screen app experience for iPhone, Android & Mac'}
+                    </div>
+                  </div>
+                </div>
+                <ChevronRight size={16} className="text-zinc-600 shrink-0" />
+              </button>
+            )}
           </div>
         </section>
 
@@ -924,10 +1013,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </section>
 
-        {/* 5. DATEN & MEDIATHEK */}
+        {/* 5. DATEN, RECHTLICHES & MEDIATHEK */}
         <section>
           <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 mb-2">
-            {isDe ? 'Daten & Mediathek' : 'Data & Library'}
+            {isDe ? 'Daten, Datenschutz & Mediathek' : 'Data, Privacy & Library'}
           </h3>
 
           <div className="divide-y divide-white/[0.08] border-y border-white/[0.08]">
@@ -972,6 +1061,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               className="hidden"
             />
 
+            {/* Privacy Policy, Terms & TMDB Attribution Sheet Trigger */}
+            <button
+              type="button"
+              onClick={() => setActiveSheet('legal')}
+              className="w-full py-4 flex items-center justify-between gap-3 hover:opacity-80 active:opacity-60 transition-opacity text-left"
+            >
+              <div className="flex items-center gap-3.5 min-w-0">
+                <Info size={18} className="text-zinc-400 shrink-0" />
+                <span className="text-[clamp(0.925rem,2.2vw,1rem)] font-medium text-white truncate">
+                  {isDe
+                    ? 'Datenschutz, Nutzungsbedingungen & Lizenzen'
+                    : 'Privacy Policy, Terms & Licenses'}
+                </span>
+              </div>
+              <ChevronRight size={16} className="text-zinc-600 shrink-0" />
+            </button>
+
             {!confirmingReset ? (
               <button
                 type="button"
@@ -1014,8 +1120,103 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               </div>
             )}
+
+            {/* Apple App Store Guideline 5.1.1(v) In-App Account & Cloud Data Deletion */}
+            {currentUser && (
+              !confirmingAccountDelete ? (
+                <button
+                  type="button"
+                  onClick={() => setConfirmingAccountDelete(true)}
+                  className="w-full py-4 flex items-center justify-between gap-3 hover:opacity-80 active:opacity-60 transition-opacity text-left"
+                >
+                  <div className="flex items-center gap-3.5 min-w-0">
+                    <Trash2 size={18} className="text-red-500 shrink-0" />
+                    <div className="min-w-0">
+                      <div className="text-[clamp(0.925rem,2.2vw,1rem)] font-medium text-red-400 truncate">
+                        {isDe
+                          ? 'Konto & Cloud-Daten endgültig löschen'
+                          : 'Permanently Delete Account & Cloud Data'}
+                      </div>
+                      <div className="text-xs text-zinc-500 truncate mt-0.5">
+                        {isDe
+                          ? 'Löscht dein Konto und alle Cloud-Backups unwiderruflich (DSGVO)'
+                          : 'Permanently erases your account and all cloud backups'}
+                      </div>
+                    </div>
+                  </div>
+                  <ChevronRight size={16} className="text-zinc-600 shrink-0" />
+                </button>
+              ) : (
+                <div className="py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-fade-in">
+                  <span className="text-xs font-medium text-red-300">
+                    {isDe
+                      ? 'Konto & alle Cloud-Daten unwiderruflich löschen?'
+                      : 'Permanently delete your account and all cloud data?'}
+                  </span>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={deletingAccount}
+                      onClick={() => setConfirmingAccountDelete(false)}
+                      className="px-3.5 py-1.5 rounded-full bg-white/10 text-white text-xs font-semibold hover:bg-white/15"
+                    >
+                      {isDe ? 'Abbrechen' : 'Cancel'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={deletingAccount}
+                      onClick={async () => {
+                        setDeletingAccount(true);
+                        try {
+                          onResetLibrary();
+                          await deleteUserAccountAndCloudData();
+                          setConfirmingAccountDelete(false);
+                          onNotify(
+                            isDe
+                              ? 'Konto und Cloud-Daten wurden vollständig gelöscht'
+                              : 'Account and cloud data permanently deleted',
+                            'info'
+                          );
+                        } catch (err: any) {
+                          onNotify(
+                            err?.message ||
+                              (isDe
+                                ? 'Konto-Löschung fehlgeschlagen'
+                                : 'Account deletion failed'),
+                            'info'
+                          );
+                        } finally {
+                          setDeletingAccount(false);
+                        }
+                      }}
+                      className="px-3.5 py-1.5 rounded-full bg-red-600 text-white text-xs font-semibold hover:bg-red-500 disabled:opacity-50"
+                    >
+                      {deletingAccount
+                        ? isDe
+                          ? 'Lösche…'
+                          : 'Deleting…'
+                        : isDe
+                        ? 'Konto löschen'
+                        : 'Delete Account'}
+                    </button>
+                  </div>
+                </div>
+              )
+            )}
           </div>
         </section>
+
+        {/* Official TMDB Attribution Footer */}
+        <footer className="pt-4 pb-2 flex flex-col items-center text-center gap-2 opacity-60">
+          <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-md bg-[#0d253f] border border-[#01b4e4]/30">
+            <span className="text-[10px] font-black tracking-widest bg-gradient-to-r from-[#90cea1] to-[#01b4e4] bg-clip-text text-transparent">
+              TMDB
+            </span>
+          </div>
+          <p className="text-[11px] text-zinc-500 max-w-sm leading-relaxed">
+            This product uses the TMDB API but is not endorsed or certified by TMDB.
+          </p>
+        </footer>
       </div>
 
       {/* --- NATIVE iOS BOTTOM SHEETS --- */}
@@ -1384,177 +1585,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             )}
 
-            {/* Sheet: TMDB Multi-Key Failover Pool (5-10 Keys + Universal Cache Metrics) */}
-            {activeSheet === 'keyPool' && (
-              <div className="overflow-y-auto no-scrollbar ios-touch-rail space-y-4">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-2xl bg-white/10 flex items-center justify-center text-white">
-                      <Key size={20} />
-                    </div>
-                    <div>
-                      <h3 className="text-lg font-bold text-white">
-                        {isDe ? 'TMDB Multi-Key Failover-Pool' : 'TMDB Multi-Key Failover Pool'}
-                      </h3>
-                      <p className="text-xs text-zinc-400">
-                        {isDe
-                          ? 'AES-256-GCM verschlüsselter Server-Tresor'
-                          : 'AES-256-GCM encrypted server key pool'}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={refreshSecurityAndPoolInfo}
-                      aria-label="Refresh pool status"
-                      className="w-8 h-8 rounded-full bg-white/10 text-zinc-300 hover:text-white flex items-center justify-center"
-                    >
-                      <RefreshCw size={14} />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setActiveSheet(null)}
-                      className="w-8 h-8 rounded-full bg-white/10 text-zinc-300 hover:text-white flex items-center justify-center"
-                    >
-                      <X size={16} />
-                    </button>
-                  </div>
-                </div>
-
-                {/* High-Throughput 1,000-User Pipeline Summary */}
-                {keyPoolStatus && (
-                  <div className="grid grid-cols-3 gap-2 text-center">
-                    <div className="p-3 rounded-2xl bg-black/40 border border-white/[0.08]">
-                      <div className="text-lg font-bold text-white tabular-nums">
-                        {keyPoolStatus.healthyCount}/{keyPoolStatus.poolSize}
-                      </div>
-                      <div className="text-[11px] text-zinc-400">
-                        {isDe ? 'Bereite Keys' : 'Healthy Keys'}
-                      </div>
-                    </div>
-                    <div className="p-3 rounded-2xl bg-black/40 border border-white/[0.08]">
-                      <div className="text-lg font-bold text-emerald-400 tabular-nums">
-                        {keyPoolStatus.cacheStats.hitRatePercent}%
-                      </div>
-                      <div className="text-[11px] text-zinc-400">
-                        {isDe ? 'Cache-Quote' : 'Cache Hit Rate'}
-                      </div>
-                    </div>
-                    <div className="p-3 rounded-2xl bg-black/40 border border-white/[0.08]">
-                      <div className="text-lg font-bold text-white tabular-nums">
-                        ~{keyPoolStatus.estimatedRpsCapacity}/s
-                      </div>
-                      <div className="text-[11px] text-zinc-400">
-                        {isDe ? 'Miss-Kapazität' : 'Miss Capacity'}
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* Active Keys List */}
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between text-xs text-zinc-400 px-1">
-                    <span>
-                      {isDe ? 'Aktive rotierende Server-Keys' : 'Active Rotating Server Keys'}
-                    </span>
-                    {keyPoolStatus && (
-                      <span className="tabular-nums">
-                        {keyPoolStatus.cacheStats.l1Entries} gecachte Antworten
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="divide-y divide-white/[0.06] rounded-2xl bg-black/35 border border-white/[0.08] max-h-48 overflow-y-auto no-scrollbar">
-                    {keyPoolStatus?.keys.map((k) => (
-                      <div
-                        key={k.keyId}
-                        className="px-3.5 py-2.5 flex items-center justify-between gap-2 text-xs"
-                      >
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono font-bold text-white">
-                              #{k.slotNumber} · {k.maskedKey}
-                            </span>
-                            <span className="text-zinc-500">
-                              · {k.source === 'env' ? '.env' : 'Tresor'}
-                            </span>
-                          </div>
-                          <div className="text-[11px] text-zinc-400 tabular-nums mt-0.5">
-                            {k.status === 'healthy'
-                              ? isDe
-                                ? `Bereit · ${k.totalRequests} Req · ${k.lastLatencyMs || 18}ms`
-                                : `Healthy · ${k.totalRequests} req · ${k.lastLatencyMs || 18}ms`
-                              : k.status === 'cooldown'
-                              ? isDe
-                                ? `Cooldown (${k.cooldownRemainingSec}s) · Failovers: ${k.failoverCount}`
-                                : `Cooldown (${k.cooldownRemainingSec}s)`
-                              : isDe
-                              ? 'Ungültig'
-                              : 'Invalid'}
-                          </div>
-                        </div>
-
-                        {k.source === 'vault' && (keyPoolStatus?.poolSize || 0) > 1 && (
-                          <button
-                            type="button"
-                            disabled={keyPoolBusy}
-                            onClick={() => handleRemoveKeyFromPool(k.keyId)}
-                            className="p-1.5 rounded-lg text-zinc-500 hover:text-red-400 hover:bg-white/5 transition-colors"
-                            aria-label="Remove key"
-                          >
-                            <Trash2 size={14} />
-                          </button>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Add 1-10 Keys Form */}
-                <form onSubmit={handleAddKeysToPool} className="space-y-3 pt-1">
-                  <label className="block text-xs font-semibold text-zinc-300">
-                    {isDe
-                      ? 'Weitere TMDB API-Schlüssel hinzufügen (1 bis 10 Keys, getrennt durch Komma oder Zeilenumbruch):'
-                      : 'Add TMDB API keys (1 to 10 keys, comma or newline separated):'}
-                  </label>
-                  <textarea
-                    rows={3}
-                    value={newKeysInput}
-                    onChange={(e) => setNewKeysInput(e.target.value)}
-                    placeholder={
-                      isDe
-                        ? 'z.B. a1b2c3d4e5..., f6g7h8i9j0...'
-                        : 'e.g. a1b2c3d4e5..., f6g7h8i9j0...'
-                    }
-                    className="w-full p-3 rounded-xl bg-black/50 border border-white/15 focus:border-white text-xs font-mono text-white placeholder-zinc-500 outline-none resize-none select-text"
-                  />
-                  <button
-                    type="submit"
-                    disabled={keyPoolBusy || !newKeysInput.trim()}
-                    className="w-full py-3 rounded-xl bg-white text-black font-bold text-sm hover:bg-zinc-200 transition-colors flex items-center justify-center gap-2 disabled:opacity-45"
-                  >
-                    <Plus size={16} />
-                    <span>
-                      {keyPoolBusy
-                        ? isDe
-                          ? 'Prüfe & verschlüssele Keys...'
-                          : 'Testing & encrypting keys...'
-                        : isDe
-                        ? 'Im Server-Pool speichern & rotieren'
-                        : 'Save & Rotate in Server Pool'}
-                    </span>
-                  </button>
-                </form>
-
-                {keyPoolError && (
-                  <p className="text-xs font-semibold text-red-300 text-center">
-                    {keyPoolError}
-                  </p>
-                )}
-              </div>
-            )}
-
             {/* Sheet: Streaming Subscriptions */}
             {activeSheet === 'providers' && (
               <>
@@ -1733,6 +1763,119 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   })}
                 </div>
               </>
+            )}
+
+            {/* Sheet: iOS Safari Home-Screen Installation Guide */}
+            {activeSheet === 'iosInstall' && (
+              <div className="overflow-y-auto no-scrollbar ios-touch-rail space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-lg font-bold text-white">
+                    {isDe ? 'Auf iPhone / iPad installieren' : 'Install on iPhone / iPad'}
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => setActiveSheet(null)}
+                    className="w-8 h-8 rounded-full bg-white/10 text-zinc-300 hover:text-white flex items-center justify-center"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+                <div className="p-4 rounded-2xl bg-black/40 border border-white/10 space-y-3 text-xs text-zinc-300 leading-relaxed">
+                  <p>
+                    {isDe
+                      ? 'So installierst du MovieJournal als Vollbild-App auf deinem iPhone:'
+                      : 'How to install MovieJournal as a full-screen app on your iPhone:'}
+                  </p>
+                  <ol className="list-decimal list-inside space-y-2 text-white font-medium">
+                    <li>
+                      {isDe
+                        ? 'Tippe unten in Safari auf das Teilen-Symbol (Quadrat mit Pfeil nach oben).'
+                        : 'Tap the Share button in the Safari toolbar.'}
+                    </li>
+                    <li>
+                      {isDe
+                        ? 'Scrolle nach unten und wähle „Zum Home-Bildschirm“.'
+                        : 'Scroll down and tap "Add to Home Screen".'}
+                    </li>
+                    <li>
+                      {isDe
+                        ? 'Bestätige oben rechts mit „Hinzufügen“.'
+                        : 'Tap "Add" in the top-right corner.'}
+                    </li>
+                  </ol>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveSheet(null)}
+                  className="w-full py-3 rounded-xl bg-white text-black font-bold text-sm hover:bg-zinc-200 transition-colors"
+                >
+                  {isDe ? 'Verstanden' : 'Got It'}
+                </button>
+              </div>
+            )}
+
+            {/* Sheet: Privacy Policy, Terms of Use & TMDB Attribution (App Store Compliance) */}
+            {activeSheet === 'legal' && (
+              <div className="overflow-y-auto no-scrollbar ios-touch-rail space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-lg font-bold text-white">
+                    {isDe
+                      ? 'Datenschutz & Nutzungsbedingungen'
+                      : 'Privacy Policy & Terms of Use'}
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => setActiveSheet(null)}
+                    className="w-8 h-8 rounded-full bg-white/10 text-zinc-300 hover:text-white flex items-center justify-center"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <div className="space-y-3 text-xs text-zinc-300 leading-relaxed">
+                  <div className="p-3.5 rounded-2xl bg-black/40 border border-white/10 space-y-1.5">
+                    <div className="font-bold text-white">
+                      {isDe ? '1. Datenschutz (DSGVO / GDPR)' : '1. Data Privacy (GDPR)'}
+                    </div>
+                    <p>
+                      {isDe
+                        ? 'MovieJournal speichert deine Watchlist, gesehenen Episoden und Streaming-Präferenzen standardmäßig lokal auf deinem Gerät. Wenn du dich optional mit deinem Konto anmeldest, werden ausschließlich deine Kontodaten (UID, Name, E-Mail) sowie deine persönliche Watchlist und dein Serien-Fortschritt verschlüsselt über Google Firebase (Region europe-west2) synchronisiert. Es findet kein Werbe-Tracking und keine Weitergabe an Dritte statt.'
+                        : 'MovieJournal stores your watchlist, episode progress, and streaming preferences locally on your device by default. When you optionally sign in, only your account identifier and library progress are synchronized via Google Firebase. We never sell data or use advertising trackers.'}
+                    </p>
+                  </div>
+
+                  <div className="p-3.5 rounded-2xl bg-black/40 border border-white/10 space-y-1.5">
+                    <div className="font-bold text-white">
+                      {isDe
+                        ? '2. Konto- & Datenlöschung (App Store Richtlinie 5.1.1)'
+                        : '2. Account & Data Deletion'}
+                    </div>
+                    <p>
+                      {isDe
+                        ? 'Du kannst deine lokale Mediathek jederzeit zurücksetzen oder dein gesamtes Konto inklusive aller gespeicherten Cloud-Backups direkt in den Einstellungen unter „Konto & Cloud-Daten endgültig löschen“ unwiderruflich entfernen.'
+                        : 'You can reset your local library or permanently delete your account and all cloud backups at any time directly inside Settings under "Permanently Delete Account & Cloud Data".'}
+                    </p>
+                  </div>
+
+                  <div className="p-3.5 rounded-2xl bg-black/40 border border-white/10 space-y-1.5">
+                    <div className="font-bold text-white">
+                      {isDe ? '3. TMDB Datenquelle & Lizenzhinweis' : '3. TMDB Attribution'}
+                    </div>
+                    <p>
+                      This product uses the TMDB API but is not endorsed or certified by TMDB.
+                      Streaming availability data is provided via JustWatch / TMDB.
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveSheet(null)}
+                  className="w-full py-3 rounded-xl bg-white text-black font-bold text-sm hover:bg-zinc-200 transition-colors"
+                >
+                  {isDe ? 'Schließen' : 'Close'}
+                </button>
+              </div>
             )}
           </div>
         </div>

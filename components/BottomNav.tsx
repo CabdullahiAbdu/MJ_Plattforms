@@ -15,11 +15,11 @@ interface TabItem {
 }
 
 const TABS: TabItem[] = [
-  { view: AppView.HOME, label: 'Home', renderIcon: () => <Home size={19} /> },
-  { view: AppView.SEARCH, label: 'Discover', renderIcon: () => <Search size={19} /> },
-  { view: AppView.CALENDAR, label: 'Calendar', renderIcon: () => <Calendar size={19} /> },
-  { view: AppView.WATCHLIST, label: 'Library', renderIcon: () => <Check size={19} /> },
-  { view: AppView.SETTINGS, label: 'Settings', renderIcon: () => <Settings size={19} /> },
+  { view: AppView.HOME, label: 'Startseite', renderIcon: () => <Home size={19} /> },
+  { view: AppView.SEARCH, label: 'Entdecken & Suche', renderIcon: () => <Search size={19} /> },
+  { view: AppView.CALENDAR, label: 'Release-Kalender', renderIcon: () => <Calendar size={19} /> },
+  { view: AppView.WATCHLIST, label: 'Meine Watchlist', renderIcon: () => <Check size={19} /> },
+  { view: AppView.SETTINGS, label: 'Einstellungen', renderIcon: () => <Settings size={19} /> },
 ];
 
 export const BottomNav: React.FC<BottomNavProps> = ({ currentView, navigate }) => {
@@ -227,6 +227,11 @@ export const BottomNav: React.FC<BottomNavProps> = ({ currentView, navigate }) =
         currentViewRef.current = targetView;
         haptics.selection();
         navigate(targetView);
+      } else {
+        // Native iOS App Store feel: tapping the active tab scrolls the current view smoothly back to top
+        haptics.light();
+        const mainScroll = document.querySelector<HTMLElement>('main');
+        mainScroll?.scrollTo({ top: 0, behavior: 'smooth' });
       }
     } else {
       const settledIdx = Math.max(

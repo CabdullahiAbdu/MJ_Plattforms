@@ -28,6 +28,10 @@ import {
   isFirestoreQuotaError,
   markWriteQuotaExhausted,
 } from '../services/firebase';
+import {
+  initPerformanceMonitor,
+  syncHardwareTierAttributes,
+} from '../services/performanceMonitor';
 
 export const STORAGE_KEYS = {
   API: 'tmdb_key_v2',
@@ -146,7 +150,9 @@ export const ConfigProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (typeof document !== 'undefined') {
       document.documentElement.setAttribute('data-tv-mode', isTvMode ? 'true' : 'false');
     }
-  }, [isTvMode]);
+    initPerformanceMonitor(dataSaver);
+    syncHardwareTierAttributes(dataSaver);
+  }, [isTvMode, dataSaver]);
 
   // Auto-enable TV mode when a VIDAA / Smart TV hardware remote key is pressed while in 'auto' mode
   useEffect(() => {
@@ -186,9 +192,24 @@ export const ConfigProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     return Boolean(flag);
   }
 
-  // Always play the Cinema Intro Opener on initial app boot / page reload
-  const [showIntro, setShowIntro] = useState<boolean>(true);
+  // Phase 1: Instant startup < 2s. Render active view immediately on frame 1;
+  // only play Cinema Intro Opener once per session and after First Paint.
+  const [showIntro, setShowIntro] = useState<boolean>(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const seenInSession = window.sessionStorage.getItem('mj_intro_shown_v1') === '1';
+      if (!seenInSession) {
+        window.requestAnimationFrame(() => {
+          setShowIntro(true);
+        });
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
 
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [isAuthReady, setIsAuthReady] = useState<boolean>(false);
@@ -200,6 +221,13 @@ export const ConfigProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const completeIntro = useCallback(() => {
     setShowIntro(false);
+    if (typeof window !== 'undefined') {
+      try {
+        window.sessionStorage.setItem('mj_intro_shown_v1', '1');
+      } catch {
+        // ignore
+      }
+    }
   }, []);
 
   const replayIntro = useCallback(() => {

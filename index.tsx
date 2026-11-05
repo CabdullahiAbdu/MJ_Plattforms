@@ -52,12 +52,18 @@ class RootErrorBoundary extends React.Component<
   { children: React.ReactNode },
   ErrorBoundaryState
 > {
+  declare props: { children: React.ReactNode };
+  declare setState: (
+    updater:
+      | Partial<ErrorBoundaryState>
+      | ((prevState: ErrorBoundaryState) => Partial<ErrorBoundaryState>)
+  ) => void;
+  public state: ErrorBoundaryState = { hasError: false, errorMsg: '', retryCount: 0 };
   private keyListener: ((e: KeyboardEvent) => void) | null = null;
   private autoRetryTimer: number | null = null;
 
   constructor(props: { children: React.ReactNode }) {
     super(props);
-    this.state = { hasError: false, errorMsg: '', retryCount: 0 };
   }
 
   static getDerivedStateFromError(error: unknown): Partial<ErrorBoundaryState> {

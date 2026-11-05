@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, Suspense, lazy } from 'react';
 import { AppView, resolveMediaType } from './types';
 import { useOnlineStatus } from './hooks/usePWAInstall';
 import { getTwoFactorStatus, approveTvPairingSession } from './services/firebase';
@@ -11,25 +11,55 @@ import { LibraryProvider, useLibrary } from './context/LibraryContext';
 import { NavigationProvider, useNavigation } from './context/NavigationContext';
 import { AmbientProvider } from './context/AmbientContext';
 
-// Components
+// Eager Critical Shell & Default HomeView (Phase 1: <2s First Visible Content)
 import { BottomNav } from './components/BottomNav';
 import { TvTopBurgerNav } from './components/TvTopBurgerNav';
 import { GlobalBackground } from './components/GlobalBackground';
-import { IntroOpener } from './components/IntroOpener';
 import { Transitor } from './components/Transitor';
 import { DynamicIslandBar } from './components/DynamicIslandBar';
 import { QuickPeekSheet } from './components/QuickPeekSheet';
-
-// Views
 import { HomeView } from './views/HomeView';
-import { SearchView } from './views/SearchView';
-import { WatchlistView } from './views/WatchlistView';
-import { CalendarView } from './views/CalendarView';
-import { ProviderView } from './views/ProviderView';
-import { SettingsView } from './views/SettingsView';
-import { DetailView } from './views/DetailView';
-import { OnboardingView } from './views/OnboardingView';
-import { AuthView } from './views/AuthView';
+
+// Phase 1: Dynamic Code-Splitting per Tab & Overlay (reduces initial JS bundle & parse work)
+const IntroOpener = lazy(() =>
+  import('./components/IntroOpener').then((m) => ({ default: m.IntroOpener }))
+);
+const SearchView = lazy(() =>
+  import('./views/SearchView').then((m) => ({ default: m.SearchView }))
+);
+const WatchlistView = lazy(() =>
+  import('./views/WatchlistView').then((m) => ({ default: m.WatchlistView }))
+);
+const CalendarView = lazy(() =>
+  import('./views/CalendarView').then((m) => ({ default: m.CalendarView }))
+);
+const ProviderView = lazy(() =>
+  import('./views/ProviderView').then((m) => ({ default: m.ProviderView }))
+);
+const SettingsView = lazy(() =>
+  import('./views/SettingsView').then((m) => ({ default: m.SettingsView }))
+);
+const DetailView = lazy(() =>
+  import('./views/DetailView').then((m) => ({ default: m.DetailView }))
+);
+const OnboardingView = lazy(() =>
+  import('./views/OnboardingView').then((m) => ({ default: m.OnboardingView }))
+);
+const AuthView = lazy(() =>
+  import('./views/AuthView').then((m) => ({ default: m.AuthView }))
+);
+
+const ViewSkeletonFallback: React.FC = () => (
+  <div className="min-h-screen px-[var(--fluid-page-px)] pt-12 pb-28 space-y-6 animate-fade-in">
+    <div className="h-8 w-48 rounded-xl cinema-shimmer" />
+    <div className="w-full h-[clamp(220px,35dvh,360px)] rounded-3xl cinema-shimmer" />
+    <div className="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-6 gap-3.5">
+      {Array.from({ length: 6 }).map((_, idx) => (
+        <div key={idx} className="aspect-[2/3] rounded-2xl cinema-shimmer" />
+      ))}
+    </div>
+  </div>
+);
 
 const AppShell: React.FC = () => {
   const {
@@ -55,12 +85,10 @@ const AppShell: React.FC = () => {
     tmdb,
     showIntro,
     completeIntro,
-    replayIntro,
     setAuthPromptSeen,
     isAuthModalOpen,
     openAuthModal,
     closeAuthModal,
-    triggerFullTestFlow,
     currentUser,
     isAuthReady,
     isCloudSynced,
@@ -70,8 +98,6 @@ const AppShell: React.FC = () => {
     registerUserWithEmail,
     sendResetPasswordEmail,
     logoutUser,
-    serverCacheStats,
-    refreshServerStats,
     tvMode,
     setTvMode,
     isTvMode,
@@ -108,6 +134,15 @@ const AppShell: React.FC = () => {
 
   const isOnline = useOnlineStatus();
   const [requiresTwoFactorChallenge, setRequiresTwoFactorChallenge] = useState(false);
+  const [firstPaintDone, setFirstPaintDone] = useState(false);
+
+  // Phase 1: Defer ambient background rendering until after First Paint
+  useEffect(() => {
+    const id = window.requestAnimationFrame(() => {
+      setFirstPaintDone(true);
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, []);
 
   // QR-Code Second-Screen TV Pairing Companion state (?tvPair=XXXXXX scanned from iPhone)
   const [pendingTvPairCode, setPendingTvPairCode] = useState<string | null>(() => {
@@ -231,13 +266,6 @@ const AppShell: React.FC = () => {
     };
   }, [currentUser?.uid]);
 
-  const handleClearApiCache = () => {
-    if (tmdb) {
-      tmdb.clearCache();
-      showNotification('API cache refreshed (Watchlist preserved)', 'success');
-    }
-  };
-
   const handleResetLibrary = () => {
     resetLibraryData();
     showNotification('Library & Watchlist reset', 'info');
@@ -269,145 +297,150 @@ const AppShell: React.FC = () => {
         language={language}
       />
 
-      {/* 1. Standalone 60fps Cinema Projector Intro */}
+      {/* 1. Standalone 60fps Cinema Projector Intro (Deferred until after First Paint) */}
       {shouldShowStandaloneIntro && tmdb && (
-        <IntroOpener tmdb={tmdb} region={region} onComplete={completeIntro} />
+        <Suspense fallback={null}>
+          <IntroOpener tmdb={tmdb} region={region} onComplete={completeIntro} />
+        </Suspense>
       )}
 
       {/* 2. Mandatory Account Login & 2FA Gate Stage */}
       {shouldShowAuthStage && tmdb && (
-        <AuthView
-          tmdb={tmdb}
-          language={language}
-          region={region}
-          isTvMode={isTvMode}
-          isModal={isAuthModalOpen && Boolean(currentUser) && !requiresTwoFactorChallenge}
-          startWithIntro={showIntro && !isAuthModalOpen && !requiresTwoFactorChallenge}
-          forceTwoFactorChallenge={requiresTwoFactorChallenge}
-          currentUserName={
-            currentUser
-              ? currentUser.displayName || currentUser.email?.split('@')[0] || 'Cinephile'
-              : null
-          }
-          onIntroCompleted={completeIntro}
-          onCloseModal={() => {
-            if (currentUser && !requiresTwoFactorChallenge) {
-              closeAuthModal();
-              setAuthPromptSeen(true);
+        <Suspense fallback={<ViewSkeletonFallback />}>
+          <AuthView
+            tmdb={tmdb}
+            language={language}
+            region={region}
+            isTvMode={isTvMode}
+            isModal={isAuthModalOpen && Boolean(currentUser) && !requiresTwoFactorChallenge}
+            startWithIntro={showIntro && !isAuthModalOpen && !requiresTwoFactorChallenge}
+            forceTwoFactorChallenge={requiresTwoFactorChallenge}
+            currentUserName={
+              currentUser
+                ? currentUser.displayName || currentUser.email?.split('@')[0] || 'Cinephile'
+                : null
             }
-          }}
-          onSuccess={(msg) => {
-            setRequiresTwoFactorChallenge(false);
-            completeIntro();
-            setAuthPromptSeen(true);
-            closeAuthModal();
-            showNotification(msg, 'success');
-          }}
-          onSignOutDuringChallenge={async () => {
-            setRequiresTwoFactorChallenge(false);
-            await logoutUser();
-          }}
-          loginWithGoogle={loginWithGoogle}
-          loginWithApple={loginWithApple}
-          loginWithEmail={loginWithEmail}
-          registerUserWithEmail={registerUserWithEmail}
-          sendResetPasswordEmail={sendResetPasswordEmail}
-        />
+            onIntroCompleted={completeIntro}
+            onCloseModal={() => {
+              if (currentUser && !requiresTwoFactorChallenge) {
+                closeAuthModal();
+                setAuthPromptSeen(true);
+              }
+            }}
+            onSuccess={(msg) => {
+              setRequiresTwoFactorChallenge(false);
+              completeIntro();
+              setAuthPromptSeen(true);
+              closeAuthModal();
+              showNotification(msg, 'success');
+            }}
+            onSignOutDuringChallenge={async () => {
+              setRequiresTwoFactorChallenge(false);
+              await logoutUser();
+            }}
+            loginWithGoogle={loginWithGoogle}
+            loginWithApple={loginWithApple}
+            loginWithEmail={loginWithEmail}
+            registerUserWithEmail={registerUserWithEmail}
+            sendResetPasswordEmail={sendResetPasswordEmail}
+          />
+        </Suspense>
       )}
 
-      {/* Ambient Background */}
-      <div className="absolute inset-0 z-0">
-        <GlobalBackground tmdb={tmdb} />
-      </div>
+      {/* Ambient Background (Mounted after First Paint so Hero renders first) */}
+      {firstPaintDone && (
+        <div className="absolute inset-0 z-0">
+          <GlobalBackground tmdb={tmdb} />
+        </div>
+      )}
 
-      {/* Active-Tab-Only Rendering */}
+      {/* Active-Tab-Only Rendering with Per-Tab Code-Splitting & Skeleton Fallbacks */}
       {tmdb && (
         <main className="relative w-full h-full z-10 overflow-y-auto overflow-x-hidden no-scrollbar ios-touch-rail pb-[calc(env(safe-area-inset-bottom)+5.5rem)]">
-          {activeTab === AppView.HOME && (
-            <HomeView
-              tmdb={tmdb}
-              navigate={navigateToDetail}
-              onExpand={handleExpand}
-              watchlist={watchlist}
-              watchedCompositeKeys={watchedCompositeKeys}
-              watchedEpisodes={watchedEpisodes}
-              onToggleWatchlist={(item) => toggleWatchlist(item, showNotification)}
-              userGenres={userGenres}
-              userProviders={userProviders}
-            />
-          )}
+          <Suspense fallback={<ViewSkeletonFallback />}>
+            {activeTab === AppView.HOME && (
+              <HomeView
+                tmdb={tmdb}
+                navigate={navigateToDetail}
+                onExpand={handleExpand}
+                watchlist={watchlist}
+                watchedCompositeKeys={watchedCompositeKeys}
+                watchedEpisodes={watchedEpisodes}
+                onToggleWatchlist={(item) => toggleWatchlist(item, showNotification)}
+                userGenres={userGenres}
+                userProviders={userProviders}
+              />
+            )}
 
-          {activeTab === AppView.SEARCH && (
-            <SearchView
-              tmdb={tmdb}
-              navigate={navigateToDetail}
-              onExpand={handleExpand}
-              userProviders={userProviders}
-              watchlist={watchlist}
-              watchedCompositeKeys={watchedCompositeKeys}
-              userGenres={userGenres}
-            />
-          )}
+            {activeTab === AppView.SEARCH && (
+              <SearchView
+                tmdb={tmdb}
+                navigate={navigateToDetail}
+                onExpand={handleExpand}
+                userProviders={userProviders}
+                watchlist={watchlist}
+                watchedCompositeKeys={watchedCompositeKeys}
+                userGenres={userGenres}
+              />
+            )}
 
-          {activeTab === AppView.CALENDAR && (
-            <CalendarView
-              tmdb={tmdb}
-              watchlist={watchlist}
-              navigate={navigateToDetail}
-              onExpand={handleExpand}
-            />
-          )}
+            {activeTab === AppView.CALENDAR && (
+              <CalendarView
+                tmdb={tmdb}
+                watchlist={watchlist}
+                navigate={navigateToDetail}
+                onExpand={handleExpand}
+              />
+            )}
 
-          {activeTab === AppView.WATCHLIST && (
-            <WatchlistView
-              watchlist={watchlist}
-              tmdb={tmdb}
-              navigate={navigateToDetail}
-              onExpand={handleExpand}
-              watchedEpisodes={watchedEpisodes}
-              watchedMovies={watchedMovies}
-              manuallyWatchedShows={manuallyWatchedShows}
-              onToggleMovieWatched={toggleMovieWatched}
-              onToggleShowWatched={toggleShowFullyWatched}
-            />
-          )}
+            {activeTab === AppView.WATCHLIST && (
+              <WatchlistView
+                watchlist={watchlist}
+                tmdb={tmdb}
+                navigate={navigateToDetail}
+                onExpand={handleExpand}
+                watchedEpisodes={watchedEpisodes}
+                watchedMovies={watchedMovies}
+                manuallyWatchedShows={manuallyWatchedShows}
+                onToggleMovieWatched={toggleMovieWatched}
+                onToggleShowWatched={toggleShowFullyWatched}
+              />
+            )}
 
-          {activeTab === AppView.SETTINGS && (
-            <SettingsView
-              tmdb={tmdb}
-              currentLanguage={language}
-              setLanguage={setLanguage}
-              currentRegion={region}
-              setRegion={setRegion}
-              onClearApiCache={handleClearApiCache}
-              onResetLibrary={handleResetLibrary}
-              onExportLibrary={exportLibraryJson}
-              onImportLibrary={importLibraryJson}
-              onNotify={showNotification}
-              currentTheme={theme}
-              setTheme={setTheme}
-              userProviders={userProviders}
-              setUserProviders={setUserProviders}
-              autoplay={autoplay}
-              setAutoplay={setAutoplay}
-              dataSaver={dataSaver}
-              setDataSaver={setDataSaver}
-              includeAdult={includeAdult}
-              setIncludeAdult={setIncludeAdult}
-              currentUser={currentUser}
-              isCloudSynced={isCloudSynced}
-              openAuthModal={openAuthModal}
-              logoutUser={logoutUser}
-              replayIntro={replayIntro}
-              triggerFullTestFlow={triggerFullTestFlow}
-              onReopenOnboarding={() => setOnboardingComplete(false)}
-              serverCacheStats={serverCacheStats}
-              refreshServerStats={refreshServerStats}
-              tvMode={tvMode}
-              setTvMode={setTvMode}
-              isTvMode={isTvMode}
-            />
-          )}
+            {activeTab === AppView.SETTINGS && (
+              <SettingsView
+                tmdb={tmdb}
+                currentLanguage={language}
+                setLanguage={setLanguage}
+                currentRegion={region}
+                setRegion={setRegion}
+                onResetLibrary={handleResetLibrary}
+                onExportLibrary={exportLibraryJson}
+                onImportLibrary={(rawJson) => {
+                  const ok = importLibraryJson(rawJson);
+                  return { ok, count: ok ? watchlist.length : 0 };
+                }}
+                onNotify={showNotification}
+                currentTheme={theme}
+                setTheme={setTheme}
+                userProviders={userProviders}
+                setUserProviders={setUserProviders}
+                autoplay={autoplay}
+                setAutoplay={setAutoplay}
+                dataSaver={dataSaver}
+                setDataSaver={setDataSaver}
+                includeAdult={includeAdult}
+                setIncludeAdult={setIncludeAdult}
+                currentUser={currentUser}
+                isCloudSynced={isCloudSynced}
+                openAuthModal={openAuthModal}
+                logoutUser={logoutUser}
+                tvMode={tvMode}
+                setTvMode={setTvMode}
+                isTvMode={isTvMode}
+              />
+            )}
+          </Suspense>
         </main>
       )}
 
@@ -419,39 +452,41 @@ const AppShell: React.FC = () => {
           tmdb={tmdb}
           onClose={closeExpand}
         >
-          <DetailView
-            id={expandingItem.item.id}
-            type={resolveMediaType(expandingItem.item)}
-            view={
-              expandingItem.item.media_type === 'person'
-                ? AppView.PERSON
-                : expandingItem.item.media_type === 'collection'
-                ? AppView.COLLECTION
-                : expandingItem.item.media_type === 'company'
-                ? AppView.COMPANY
-                : AppView.DETAILS
-            }
-            seedItem={expandingItem.item}
-            userProviders={userProviders}
-            autoplay={autoplay}
-            autoPlayTrailer={
-              expandingItem.autoPlayTrailer !== undefined
-                ? expandingItem.autoPlayTrailer && autoplay
-                : false
-            }
-            tmdb={tmdb}
-            kinoCheckKey={kinoCheckKey}
-            navigate={navigateToDetail}
-            onBack={closeExpand}
-            isInWatchlist={isInWatchlist(
-              expandingItem.item.id,
-              resolveMediaType(expandingItem.item)
-            )}
-            onToggleWatchlist={(item) => toggleWatchlist(item, showNotification)}
-            watchedEpisodes={watchedEpisodes[expandingItem.item.id] || []}
-            onToggleEpisode={(epId) => toggleEpisodeWatched(expandingItem.item.id, epId)}
-            isOverlay={true}
-          />
+          <Suspense fallback={<ViewSkeletonFallback />}>
+            <DetailView
+              id={expandingItem.item.id}
+              type={resolveMediaType(expandingItem.item)}
+              view={
+                expandingItem.item.media_type === 'person'
+                  ? AppView.PERSON
+                  : expandingItem.item.media_type === 'collection'
+                  ? AppView.COLLECTION
+                  : expandingItem.item.media_type === 'company'
+                  ? AppView.COMPANY
+                  : AppView.DETAILS
+              }
+              seedItem={expandingItem.item}
+              userProviders={userProviders}
+              autoplay={autoplay}
+              autoPlayTrailer={
+                expandingItem.autoPlayTrailer !== undefined
+                  ? expandingItem.autoPlayTrailer && autoplay
+                  : false
+              }
+              tmdb={tmdb}
+              kinoCheckKey={kinoCheckKey}
+              navigate={navigateToDetail}
+              onBack={closeExpand}
+              isInWatchlist={isInWatchlist(
+                expandingItem.item.id,
+                resolveMediaType(expandingItem.item)
+              )}
+              onToggleWatchlist={(item) => toggleWatchlist(item, showNotification)}
+              watchedEpisodes={watchedEpisodes[expandingItem.item.id] || []}
+              onToggleEpisode={(epId) => toggleEpisodeWatched(expandingItem.item.id, epId)}
+              isOverlay={true}
+            />
+          </Suspense>
         </Transitor>
       )}
 
@@ -461,60 +496,64 @@ const AppShell: React.FC = () => {
           data-scroll-container="overlay"
           className="fixed inset-0 z-50 bg-black animate-ios-slide-in overflow-y-auto overflow-x-hidden no-scrollbar ios-touch-rail"
         >
-          {activeOverlay.view === AppView.PROVIDER ? (
-            <ProviderView
-              providerId={activeOverlay.params?.id || 8}
-              providerName={activeOverlay.params?.name || 'Streaming'}
-              logo={activeOverlay.params?.logo || ''}
-              tmdb={tmdb}
-              navigate={navigateToDetail}
-              onBack={goBack}
-            />
-          ) : (
-            <DetailView
-              id={activeOverlay.params?.id || 0}
-              type={(activeOverlay.params?.type as any) || 'movie'}
-              view={activeOverlay.view}
-              seedItem={activeOverlay.params?.seedItem}
-              userProviders={userProviders}
-              autoplay={autoplay}
-              autoPlayTrailer={
-                activeOverlay.params?.autoPlayTrailer ? autoplay : false
-              }
-              tmdb={tmdb}
-              kinoCheckKey={kinoCheckKey}
-              onBack={goBack}
-              navigate={navigateToDetail}
-              isInWatchlist={isInWatchlist(
-                activeOverlay.params?.id || 0,
-                activeOverlay.params?.type || 'movie'
-              )}
-              onToggleWatchlist={(item) => toggleWatchlist(item, showNotification)}
-              watchedEpisodes={watchedEpisodes[activeOverlay.params?.id || 0] || []}
-              onToggleEpisode={(epId) =>
-                toggleEpisodeWatched(activeOverlay.params?.id || 0, epId)
-              }
-            />
-          )}
+          <Suspense fallback={<ViewSkeletonFallback />}>
+            {activeOverlay.view === AppView.PROVIDER ? (
+              <ProviderView
+                providerId={activeOverlay.params?.id || 8}
+                providerName={activeOverlay.params?.name || 'Streaming'}
+                logo={activeOverlay.params?.logo || ''}
+                tmdb={tmdb}
+                navigate={navigateToDetail}
+                onBack={goBack}
+              />
+            ) : (
+              <DetailView
+                id={activeOverlay.params?.id || 0}
+                type={(activeOverlay.params?.type as any) || 'movie'}
+                view={activeOverlay.view}
+                seedItem={activeOverlay.params?.seedItem}
+                userProviders={userProviders}
+                autoplay={autoplay}
+                autoPlayTrailer={
+                  activeOverlay.params?.autoPlayTrailer ? autoplay : false
+                }
+                tmdb={tmdb}
+                kinoCheckKey={kinoCheckKey}
+                onBack={goBack}
+                navigate={navigateToDetail}
+                isInWatchlist={isInWatchlist(
+                  activeOverlay.params?.id || 0,
+                  activeOverlay.params?.type || 'movie'
+                )}
+                onToggleWatchlist={(item) => toggleWatchlist(item, showNotification)}
+                watchedEpisodes={watchedEpisodes[activeOverlay.params?.id || 0] || []}
+                onToggleEpisode={(epId) =>
+                  toggleEpisodeWatched(activeOverlay.params?.id || 0, epId)
+                }
+              />
+            )}
+          </Suspense>
         </div>
       )}
 
       {/* 3. Onboarding Flow */}
       {shouldShowOnboarding && tmdb && (
-        <OnboardingView
-          tmdb={tmdb}
-          onComplete={() => setOnboardingComplete(true)}
-          setLanguage={setLanguage}
-          setRegion={setRegion}
-          setTheme={setTheme}
-          setUserGenres={setUserGenres}
-          setUserProviders={setUserProviders}
-          setIncludeAdult={setIncludeAdult}
-          setAutoplay={setAutoplay}
-          setDataSaver={setDataSaver}
-          currentUser={currentUser}
-          openAuthModal={openAuthModal}
-        />
+        <Suspense fallback={<ViewSkeletonFallback />}>
+          <OnboardingView
+            tmdb={tmdb}
+            onComplete={() => setOnboardingComplete(true)}
+            setLanguage={setLanguage}
+            setRegion={setRegion}
+            setTheme={setTheme}
+            setUserGenres={setUserGenres}
+            setUserProviders={setUserProviders}
+            setIncludeAdult={setIncludeAdult}
+            setAutoplay={setAutoplay}
+            setDataSaver={setDataSaver}
+            currentUser={currentUser}
+            openAuthModal={openAuthModal}
+          />
+        </Suspense>
       )}
 
       {/* iOS Long-Press Quick Peek Context Sheet */}

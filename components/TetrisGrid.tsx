@@ -2,6 +2,7 @@ import React from 'react';
 import { MediaItem, Rect } from '../types';
 import { TmdbService } from '../services/tmdb';
 import { MediaCard } from './MovieCard';
+import { getOptimalCardPosterSize } from '../services/performanceMonitor';
 
 interface TetrisGridProps {
   items: MediaItem[];
@@ -37,6 +38,8 @@ export const TetrisGrid: React.FC<TetrisGridProps> = ({
 
   if (!tmdb || !items) return null;
 
+  const posterSize = getOptimalCardPosterSize('masonry');
+
   return (
     <div className="fluid-poster-grid w-full max-w-[2400px] mx-auto items-start">
       {items.map((item, idx) => {
@@ -50,7 +53,7 @@ export const TetrisGrid: React.FC<TetrisGridProps> = ({
             <MediaCard
               item={item}
               onClick={onClick}
-              imageUrl={tmdb.getImageUrl(imgPath, 'w500')}
+              imageUrl={tmdb.getImageUrl(imgPath, posterSize)}
               variant="masonry"
               tmdb={tmdb}
               bottomInfo={item.display_role}

@@ -558,7 +558,7 @@ export const DetailView: React.FC<DetailViewProps> = ({
   const handleNativeShare = async () => {
     if (!detailState.item) return;
     const res = await shareMediaItem(detailState.item as MediaItem);
-    if (res === 'copied') {
+    if (res) {
       setShareCopied(true);
       setTimeout(() => setShareCopied(false), 2200);
     }

@@ -445,17 +445,22 @@ export const HomeView: React.FC<HomeViewProps> = ({
             className="w-full max-w-[2200px] mx-auto rounded-3xl p-8 md:p-12 bg-zinc-900/80 text-center space-y-4"
           >
             <h2 className="text-[length:var(--fluid-h2)] font-bold text-white">
-              Unable to load featured catalogue
+              {languageCode.startsWith('de')
+                ? 'Katalog konnte nicht geladen werden'
+                : 'Unable to load featured catalogue'}
             </h2>
             <p className="text-[length:var(--fluid-body)] text-zinc-400">
-              Please verify your network connection.
+              {languageCode.startsWith('de')
+                ? 'Bitte überprüfe deine Internetverbindung.'
+                : 'Please verify your network connection.'}
             </p>
             <button
               type="button"
               onClick={loadHeroFeed}
               className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-white text-black font-bold text-sm hover:bg-zinc-200 transition-colors"
             >
-              <RefreshCw size={16} /> Retry
+              <RefreshCw size={16} />{' '}
+              {languageCode.startsWith('de') ? 'Erneut versuchen' : 'Retry'}
             </button>
           </div>
         ) : (
@@ -593,11 +598,10 @@ export const HomeView: React.FC<HomeViewProps> = ({
             <div className="px-[var(--fluid-page-px)] mb-2 md:mb-3 flex items-end justify-between">
               <div>
                 <h3 className="text-[length:var(--fluid-h2)] font-bold text-white tracking-tight">
-                  Als Nächstes & Weiterstreamen
+                  {languageCode.startsWith('de')
+                    ? 'Als Nächstes & Weiterstreamen'
+                    : 'Continue Watching & Up Next'}
                 </h3>
-                <p className="text-zinc-400 font-normal text-[clamp(0.68rem,calc(0.64rem+0.15vw),0.8rem)] mt-0.5">
-                  Deine begonnenen Serien & Watchlist-Favoriten
-                </p>
               </div>
             </div>
             <div
@@ -683,9 +687,10 @@ export const HomeView: React.FC<HomeViewProps> = ({
               ? `Top 10 auf ${activeFilterProviderObj.provider_name}`
               : activeProviderFilter === 'my_subs'
               ? 'Top 10 in deinen Abos'
+              : languageCode.startsWith('de')
+              ? 'Top 10 Filme heute'
               : 'Top 10 Movies Today'
           }
-          subtitle={`Most watched in ${regionCode}`}
           queryKey={`home:top10-movie:${languageCode}:${regionCode}:${providerFilterKey}`}
           fetcher={(p) =>
             tmdb.discoverRegional(
@@ -698,13 +703,15 @@ export const HomeView: React.FC<HomeViewProps> = ({
           tmdb={tmdb}
           onClick={handleCardOpen}
           onExtend={() =>
-            openExtendedView('Top Movies Today', (p) =>
-              tmdb.discoverRegional(
-                'movie',
-                { sort_by: 'popularity.desc' },
-                p,
-                { providerIds: effectiveProviderIds }
-              )
+            openExtendedView(
+              languageCode.startsWith('de') ? 'Top 10 Filme heute' : 'Top Movies Today',
+              (p) =>
+                tmdb.discoverRegional(
+                  'movie',
+                  { sort_by: 'popularity.desc' },
+                  p,
+                  { providerIds: effectiveProviderIds }
+                )
             )
           }
           variant="ranked"
@@ -716,9 +723,10 @@ export const HomeView: React.FC<HomeViewProps> = ({
               ? `Serien-Highlights auf ${activeFilterProviderObj.provider_name}`
               : activeProviderFilter === 'my_subs'
               ? 'Serien in deinen Abos'
+              : languageCode.startsWith('de')
+              ? 'Beliebte Serien'
               : 'Essential Television'
           }
-          subtitle={`Series trending in ${regionCode}`}
           queryKey={`home:essential-tv:${languageCode}:${regionCode}:${providerFilterKey}`}
           fetcher={(p) =>
             tmdb.discoverRegional(
@@ -731,13 +739,15 @@ export const HomeView: React.FC<HomeViewProps> = ({
           tmdb={tmdb}
           onClick={handleCardOpen}
           onExtend={() =>
-            openExtendedView('Essential Television', (p) =>
-              tmdb.discoverRegional(
-                'tv',
-                { sort_by: 'popularity.desc' },
-                p,
-                { providerIds: effectiveProviderIds }
-              )
+            openExtendedView(
+              languageCode.startsWith('de') ? 'Beliebte Serien' : 'Essential Television',
+              (p) =>
+                tmdb.discoverRegional(
+                  'tv',
+                  { sort_by: 'popularity.desc' },
+                  p,
+                  { providerIds: effectiveProviderIds }
+                )
             )
           }
           variant="backdrop"
@@ -745,14 +755,20 @@ export const HomeView: React.FC<HomeViewProps> = ({
 
         {/* Endpoint #5: /tv/airing_today (Heute mit neuer Folge im TV & Stream) */}
         <CinematicRow
-          title="Heute mit neuer Folge"
-          subtitle="Serien mit brandneuer Episode heute im Stream & TV"
+          title={
+            languageCode.startsWith('de') ? 'Heute mit neuer Folge' : 'New Episodes Airing Today'
+          }
           queryKey={`home:airing-today-tv:${languageCode}:${regionCode}`}
           fetcher={(p) => tmdb.getAiringTodayTv(p)}
           tmdb={tmdb}
           onClick={handleCardOpen}
           onExtend={() =>
-            openExtendedView('Heute mit neuer Folge', (p) => tmdb.getAiringTodayTv(p))
+            openExtendedView(
+              languageCode.startsWith('de')
+                ? 'Heute mit neuer Folge'
+                : 'New Episodes Airing Today',
+              (p) => tmdb.getAiringTodayTv(p)
+            )
           }
           variant="backdrop"
         />
@@ -760,11 +776,13 @@ export const HomeView: React.FC<HomeViewProps> = ({
         {personalizedGenres.map((genreId) => {
           const gName = genreMap[genreId];
           if (!gName) return null;
+          const rowTitle = languageCode.startsWith('de')
+            ? `${gName}-Highlights`
+            : `Curated ${gName}`;
           return (
             <CinematicRow
               key={genreId}
-              title={`Curated ${gName}`}
-              subtitle={`Because you enjoy ${gName}`}
+              title={rowTitle}
               queryKey={`home:genre:${genreId}:${languageCode}:${regionCode}:${providerFilterKey}`}
               fetcher={(p) =>
                 tmdb.discoverRegional(
@@ -777,7 +795,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
               tmdb={tmdb}
               onClick={handleCardOpen}
               onExtend={() =>
-                openExtendedView(`Curated ${gName}`, (p) =>
+                openExtendedView(rowTitle, (p) =>
                   tmdb.discoverRegional(
                     'movie',
                     { with_genres: genreId.toString(), sort_by: 'popularity.desc' },
@@ -844,7 +862,11 @@ export const HomeView: React.FC<HomeViewProps> = ({
               >
                 <div className="flex items-center gap-2 text-zinc-300 text-[clamp(0.68rem,calc(0.62rem+0.15vw),0.78rem)] font-semibold tracking-wide mb-1.5">
                   <Sparkles size={13} />
-                  <span>Recommended For Your Taste</span>
+                  <span>
+                    {languageCode.startsWith('de')
+                      ? 'Für deinen Geschmack empfohlen'
+                      : 'Recommended For Your Taste'}
+                  </span>
                 </div>
                 <h2
                   style={{
@@ -863,7 +885,9 @@ export const HomeView: React.FC<HomeViewProps> = ({
                 </p>
                 <div className="flex items-center gap-2.5 group/btn">
                   <span className="text-white font-bold text-[clamp(0.75rem,calc(0.7rem+0.18vw),0.88rem)] border-b border-white pb-0.5 transition-colors">
-                    Explore Recommendation
+                    {languageCode.startsWith('de')
+                      ? 'Empfehlung entdecken'
+                      : 'Explore Recommendation'}
                   </span>
                   <div className="w-8 h-8 bg-white text-black rounded-full flex items-center justify-center">
                     <ArrowRight size={15} />
@@ -876,15 +900,21 @@ export const HomeView: React.FC<HomeViewProps> = ({
 
         {/* Endpoint #6: /movie/top_rated (All-Time Top 250 Meisterwerke) */}
         <CinematicRow
-          title="All-Time Meisterwerke (Top 250)"
-          subtitle="Der zeitlose Film-Kanon der Filmgeschichte"
+          title={
+            languageCode.startsWith('de')
+              ? 'All-Time Meisterwerke (Top 250)'
+              : 'All-Time Masterpieces (Top 250)'
+          }
           queryKey={`home:official-top250:${languageCode}:${regionCode}`}
           fetcher={(p) => tmdb.getOfficialTopRated('movie', p)}
           tmdb={tmdb}
           onClick={handleCardOpen}
           onExtend={() =>
-            openExtendedView('All-Time Meisterwerke (Top 250)', (p) =>
-              tmdb.getOfficialTopRated('movie', p)
+            openExtendedView(
+              languageCode.startsWith('de')
+                ? 'All-Time Meisterwerke (Top 250)'
+                : 'All-Time Masterpieces (Top 250)',
+              (p) => tmdb.getOfficialTopRated('movie', p)
             )
           }
           variant="poster"
@@ -895,11 +925,10 @@ export const HomeView: React.FC<HomeViewProps> = ({
           <div className="py-2 md:py-3.5">
             <div className="px-[var(--fluid-page-px)] mb-2.5">
               <h3 className="text-[length:var(--fluid-h2)] font-bold text-white tracking-tight">
-                Stars & Regisseure der Woche
+                {languageCode.startsWith('de')
+                  ? 'Stars & Regisseure der Woche'
+                  : 'Trending Stars & Directors'}
               </h3>
-              <p className="text-zinc-400 font-normal text-[clamp(0.68rem,calc(0.64rem+0.15vw),0.8rem)] mt-0.5">
-                Meistgesuchte Persönlichkeiten weltweit
-              </p>
             </div>
             <div
               data-tv-row="true"
@@ -943,30 +972,32 @@ export const HomeView: React.FC<HomeViewProps> = ({
         )}
 
         <CinematicRow
-          title="Critically Acclaimed"
-          subtitle={`Highest rated cinema in ${regionCode}`}
+          title={
+            languageCode.startsWith('de') ? 'Von Kritikern gefeiert' : 'Critically Acclaimed'
+          }
           queryKey={`home:top-rated-movie:${languageCode}:${regionCode}:${providerFilterKey}`}
           fetcher={(p) => tmdb.getTopRated('movie', p, effectiveProviderIds)}
           tmdb={tmdb}
           onClick={handleCardOpen}
           onExtend={() =>
-            openExtendedView('Top Rated Movies', (p) =>
-              tmdb.getTopRated('movie', p, effectiveProviderIds)
+            openExtendedView(
+              languageCode.startsWith('de') ? 'Von Kritikern gefeiert' : 'Top Rated Movies',
+              (p) => tmdb.getTopRated('movie', p, effectiveProviderIds)
             )
           }
           variant="poster"
         />
 
         <CinematicRow
-          title="On The Air"
-          subtitle={`New episodes available in ${regionCode}`}
+          title={languageCode.startsWith('de') ? 'Aktuell auf Sendung' : 'On The Air'}
           queryKey={`home:on-the-air-tv:${languageCode}:${regionCode}:${providerFilterKey}`}
           fetcher={(p) => tmdb.getOnTheAirTv(p, effectiveProviderIds)}
           tmdb={tmdb}
           onClick={handleCardOpen}
           onExtend={() =>
-            openExtendedView('On The Air', (p) =>
-              tmdb.getOnTheAirTv(p, effectiveProviderIds)
+            openExtendedView(
+              languageCode.startsWith('de') ? 'Aktuell auf Sendung' : 'On The Air',
+              (p) => tmdb.getOnTheAirTv(p, effectiveProviderIds)
             )
           }
           variant="backdrop"

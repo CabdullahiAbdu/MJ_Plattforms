@@ -10,11 +10,13 @@ import {
   OAuthProvider,
   signInWithPopup,
   signInWithRedirect,
+  signInWithCredential,
   getRedirectResult,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   sendPasswordResetEmail,
   updateProfile,
+  deleteUser,
   signOut,
   User,
 } from 'firebase/auth';
@@ -32,6 +34,8 @@ import {
   collection,
   query,
   where,
+  limit,
+  writeBatch,
   onSnapshot,
   serverTimestamp,
 } from 'firebase/firestore';
@@ -63,6 +67,8 @@ export const db = initializeFirestore(
 );
 
 const QUOTA_EXHAUSTED_STORAGE_KEY = 'mj_fs_write_quota_until';
+const DAILY_CLIENT_QUOTA_KEY = 'mj_daily_client_fs_budget_v1';
+const MAX_DAILY_CLIENT_WRITES = 450;
 let writeQuotaCooldownUntil = 0;
 
 // Clear any legacy 6-hour network lockout from localStorage and ensure Firestore network is active
@@ -75,8 +81,36 @@ if (typeof window !== 'undefined') {
 }
 enableNetwork(db).catch(() => {});
 
+function checkAndIncrementDailyClientWriteBudget(): boolean {
+  if (typeof window === 'undefined' || !window.localStorage) return true;
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const raw = window.localStorage.getItem(DAILY_CLIENT_QUOTA_KEY);
+    let state = { day: today, writes: 0 };
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.day === today && typeof parsed.writes === 'number') {
+        state = parsed;
+      }
+    }
+    if (state.writes >= MAX_DAILY_CLIENT_WRITES) {
+      return false;
+    }
+    state.writes += 1;
+    window.localStorage.setItem(DAILY_CLIENT_QUOTA_KEY, JSON.stringify(state));
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 export function isWriteQuotaExhausted(): boolean {
   return Date.now() < writeQuotaCooldownUntil;
+}
+
+export function canPerformClientFirestoreWrite(): boolean {
+  if (isWriteQuotaExhausted()) return false;
+  return checkAndIncrementDailyClientWriteBudget();
 }
 
 export function resetWriteQuotaCooldown(): void {
@@ -101,6 +135,9 @@ export function isFirestoreQuotaError(error: unknown): boolean {
 }
 
 export const auth = (() => {
+  if (typeof window === 'undefined') {
+    return getAuth(app);
+  }
   try {
     return initializeAuth(app, {
       persistence: [browserLocalPersistence, indexedDBLocalPersistence],
@@ -231,25 +268,114 @@ export function getTwoFactorTicketStorageKey(uid: string): string {
   return `mj_2fa_ticket_${uid}`;
 }
 
-// Complete any pending OAuth redirect flow
+// Pre-warm popup resolver & complete any pending OAuth redirect flow on iOS / Safari
 if (typeof window !== 'undefined') {
+  try {
+    (browserPopupRedirectResolver as any)?._initialize?.(auth)?.catch?.(() => {});
+  } catch {
+    // ignore
+  }
   getRedirectResult(auth).catch(() => {});
 }
 
-// --- Multi-Provider Authentication with Clean Popup & Redirect Fallback ---
+// Helper to load Google Identity Services (GIS) script for iPhone Safari / PWA popup-blocker-safe OAuth2
+let gisScriptPromise: Promise<boolean> | null = null;
+function loadGoogleIdentityServicesScript(): Promise<boolean> {
+  if (typeof window === 'undefined') return Promise.resolve(false);
+  if ((window as any).google?.accounts?.oauth2) return Promise.resolve(true);
+  if (gisScriptPromise) return gisScriptPromise;
+
+  gisScriptPromise = new Promise((resolve) => {
+    const existing = document.querySelector('script[src="https://accounts.google.com/gsi/client"]');
+    if (existing) {
+      existing.addEventListener('load', () => resolve(Boolean((window as any).google?.accounts?.oauth2)));
+      existing.addEventListener('error', () => resolve(false));
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve(Boolean((window as any).google?.accounts?.oauth2));
+    script.onerror = () => resolve(false);
+    document.head.appendChild(script);
+  });
+  return gisScriptPromise;
+}
+
+// Preload GIS script in browser so iPhone Safari can invoke initTokenClient synchronously on tap if needed
+if (typeof window !== 'undefined' && !isCapacitorNative) {
+  loadGoogleIdentityServicesScript().catch(() => {});
+}
+
+async function signInWithGoogleIdentityServicesFallback(): Promise<User | null> {
+  const loaded = await loadGoogleIdentityServicesScript();
+  const oauth2 = (window as any).google?.accounts?.oauth2;
+  const clientId = (firebaseConfig as any).oAuthClientId;
+  if (!loaded || !oauth2 || !clientId) {
+    return null;
+  }
+
+  return new Promise<User | null>((resolve, reject) => {
+    try {
+      const tokenClient = oauth2.initTokenClient({
+        client_id: clientId,
+        scope: 'openid email profile',
+        prompt: 'select_account',
+        callback: async (response: any) => {
+          if (response?.error) {
+            reject(new Error(response.error));
+            return;
+          }
+          if (response?.access_token) {
+            try {
+              const cred = GoogleAuthProvider.credential(null, response.access_token);
+              const res = await signInWithCredential(auth, cred);
+              resolve(res.user);
+            } catch (credErr) {
+              reject(credErr);
+            }
+          } else {
+            resolve(null);
+          }
+        },
+        error_callback: (err: any) => {
+          reject(err);
+        },
+      });
+      tokenClient.requestAccessToken({ prompt: 'select_account' });
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+// --- Multi-Provider Authentication with iPhone Safari / PWA Safe Popup, GIS & Redirect Fallback ---
 
 export async function signInWithGoogle(): Promise<User | null> {
   try {
-    const result = await signInWithPopup(auth, googleProvider);
+    const result = await signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
     return result.user;
   } catch (err: unknown) {
-    const code = String((err as { code?: string })?.code || '');
-    if (
+    const code = String((err as { code?: string; message?: string })?.code || (err as any)?.message || '');
+    const isPopupBlockedOrUnsupported =
       code.includes('auth/popup-blocked') ||
-      code.includes('auth/operation-not-supported-in-this-environment')
-    ) {
+      code.includes('auth/cancelled-popup-request') ||
+      code.includes('auth/operation-not-supported-in-this-environment') ||
+      code.includes('auth/web-storage-unsupported');
+
+    if (isPopupBlockedOrUnsupported) {
+      // Layer 2: Try Google Identity Services OAuth2 Token Client (engineered for iOS Safari & mobile web)
+      try {
+        const gisUser = await signInWithGoogleIdentityServicesFallback();
+        if (gisUser) return gisUser;
+      } catch {
+        // Fall through to redirect
+      }
+
+      // Layer 3: Full-page OAuth Redirect fallback for iPhone Safari / Home Screen Web App
       if (!isCapacitorNative) {
-        await signInWithRedirect(auth, googleProvider);
+        await signInWithRedirect(auth, googleProvider, browserPopupRedirectResolver);
         return null;
       }
     }
@@ -701,13 +827,16 @@ async function fetchServerUserSyncState(): Promise<{
   profile?: Record<string, any>;
   library?: {
     watchlist?: MediaItem[];
+    removedWatchlistKeys?: Record<string, number>;
     watchedMovies?: number[];
+    removedMovies?: Record<string, number>;
     manuallyWatchedShows?: number[];
+    removedShows?: Record<string, number>;
     watchedEpisodes?: Record<number, number[]>;
     updatedAt?: string;
   };
 } | null> {
-  if (isCapacitorNative || !auth.currentUser) return null;
+  if (!auth.currentUser) return null;
   try {
     const headers = await getBearerHeaders();
     const res = await fetch(resolveApiBaseUrl('/api/user-sync/state'), {
@@ -725,7 +854,7 @@ async function pushServerUserSyncState(payload: {
   profile?: Record<string, any>;
   library?: Record<string, any>;
 }): Promise<void> {
-  if (isCapacitorNative || !auth.currentUser) return;
+  if (!auth.currentUser) return;
   try {
     const headers = await getBearerHeaders();
     await fetch(resolveApiBaseUrl('/api/user-sync/state'), {
@@ -931,7 +1060,7 @@ export async function updateUserProfilePrefsFirestore(
   };
 
   await pushServerUserSyncState({ profile: cleanPrefs });
-  if (isWriteQuotaExhausted()) return;
+  if (!canPerformClientFirestoreWrite()) return;
 
   try {
     costMetrics.sessionWrites += 1;
@@ -958,7 +1087,7 @@ export async function bumpUserLibrarySyncTimestamp(uid: string): Promise<string>
   await pushServerUserSyncState({
     profile: { lastLibraryUpdatedAt: nextTs },
   });
-  if (isWriteQuotaExhausted()) return nextTs;
+  if (!canPerformClientFirestoreWrite()) return nextTs;
 
   try {
     costMetrics.sessionWrites += 1;
@@ -984,6 +1113,32 @@ export interface SyncedLibrarySnapshot {
   watchedEpisodes: Record<number, number[]>;
 }
 
+/**
+ * Compacts a MediaItem before storing it in /userLibraryVault/{uid} or /api/user-sync/state
+ * so 500 items stay well below 150 KB (Firestore hard limit is 1 MiB).
+ */
+export function compactMediaItemForSync(item: MediaItem): MediaItem & { _addedAtMs?: number } {
+  const mType: 'movie' | 'tv' = resolveMediaType(item) === 'tv' ? 'tv' : 'movie';
+  return {
+    id: Math.abs(Math.floor(Number(item.id))),
+    media_type: mType,
+    title: mType === 'movie' ? (item.title || item.name || 'Untitled').slice(0, 140) : undefined,
+    name: mType === 'tv' ? (item.name || item.title || 'Untitled').slice(0, 140) : undefined,
+    poster_path: item.poster_path ? String(item.poster_path).slice(0, 120) : null,
+    backdrop_path: item.backdrop_path ? String(item.backdrop_path).slice(0, 120) : null,
+    release_date:
+      mType === 'movie'
+        ? String(item.release_date || item.first_air_date || '').slice(0, 20)
+        : undefined,
+    first_air_date:
+      mType === 'tv'
+        ? String(item.first_air_date || item.release_date || '').slice(0, 20)
+        : undefined,
+    vote_average: Math.round(Math.min(10, Math.max(0, Number(item.vote_average || 0))) * 10) / 10,
+    ...((item as any)._addedAtMs ? { _addedAtMs: Number((item as any)._addedAtMs) } : {}),
+  };
+}
+
 function normalizeEpisodeRecord(raw: Record<string, any> | undefined): Record<number, number[]> {
   const out: Record<number, number[]> = {};
   if (!raw || typeof raw !== 'object') return out;
@@ -997,6 +1152,204 @@ function normalizeEpisodeRecord(raw: Record<string, any> | undefined): Record<nu
     }
   }
   return out;
+}
+
+/**
+ * Reads the atomic 1-Doc Firestore Library Vault (/userLibraryVault/{uid}).
+ * Shared across all Cloud Run containers (ais-dev, ais-pre), Capacitor iPhone, and Smart TVs in 1 Read.
+ */
+export async function fetchUserLibraryVaultFirestore(
+  uid: string
+): Promise<Partial<SyncedLibrarySnapshot> | null> {
+  if (!uid) return null;
+  try {
+    costMetrics.sessionReads += 1;
+    const snap = await getDoc(doc(db, 'userLibraryVault', uid));
+    if (!snap.exists()) return null;
+    const data = snap.data();
+    if (!data || typeof data.libraryJson !== 'string') return null;
+    const parsed = JSON.parse(data.libraryJson);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+      watchlist: Array.isArray(parsed.watchlist) ? parsed.watchlist : [],
+      removedWatchlistKeys:
+        parsed.removedWatchlistKeys && typeof parsed.removedWatchlistKeys === 'object'
+          ? parsed.removedWatchlistKeys
+          : {},
+      watchedMovies: Array.isArray(parsed.watchedMovies) ? parsed.watchedMovies : [],
+      removedMovies:
+        parsed.removedMovies && typeof parsed.removedMovies === 'object'
+          ? parsed.removedMovies
+          : {},
+      manuallyWatchedShows: Array.isArray(parsed.manuallyWatchedShows)
+        ? parsed.manuallyWatchedShows
+        : [],
+      removedShows:
+        parsed.removedShows && typeof parsed.removedShows === 'object' ? parsed.removedShows : {},
+      watchedEpisodes: normalizeEpisodeRecord(parsed.watchedEpisodes),
+    };
+  } catch (error) {
+    if (isFirestoreQuotaError(error)) {
+      markWriteQuotaExhausted();
+    }
+    return null;
+  }
+}
+
+/**
+ * Writes the unified library snapshot atomically to /userLibraryVault/{uid} in 1 Firestore Write.
+ */
+export async function saveUserLibraryVaultFirestore(
+  uid: string,
+  snapshot: {
+    watchlist: MediaItem[];
+    removedWatchlistKeys?: Record<string, number>;
+    watchedMovies: number[];
+    removedMovies?: Record<string, number>;
+    manuallyWatchedShows: number[];
+    removedShows?: Record<string, number>;
+    watchedEpisodes: Record<number, number[]>;
+  }
+): Promise<void> {
+  if (!uid || !canPerformClientFirestoreWrite()) return;
+  try {
+    const compactedWatchlist = (snapshot.watchlist || [])
+      .slice(0, 500)
+      .map(compactMediaItemForSync);
+    const payloadObj = {
+      watchlist: compactedWatchlist,
+      removedWatchlistKeys: snapshot.removedWatchlistKeys || {},
+      watchedMovies: (snapshot.watchedMovies || []).slice(0, 500),
+      removedMovies: snapshot.removedMovies || {},
+      manuallyWatchedShows: (snapshot.manuallyWatchedShows || []).slice(0, 500),
+      removedShows: snapshot.removedShows || {},
+      watchedEpisodes: snapshot.watchedEpisodes || {},
+      updatedAtIso: new Date().toISOString(),
+    };
+    const libraryJson = JSON.stringify(payloadObj);
+    if (libraryJson.length > 850000) return;
+
+    costMetrics.sessionWrites += 1;
+    await setDoc(doc(db, 'userLibraryVault', uid), {
+      uid: String(uid).trim(),
+      libraryJson,
+      itemCount: Math.max(0, Math.min(5000, Math.floor(compactedWatchlist.length))),
+      updatedAtMs: Math.max(1, Math.floor(Date.now())),
+    });
+  } catch (error) {
+    if (isFirestoreQuotaError(error)) {
+      markWriteQuotaExhausted();
+      return;
+    }
+    // Server bridge (/api/user-sync/state) also mirrors the vault; avoid crashing the UI on transient client rule/network races
+    console.warn('Client userLibraryVault sync fallback to server bridge:', error);
+  }
+}
+
+/**
+ * Permanently deletes the signed-in user's cloud data (Watchlist, Progress, Vaults, Profile)
+ * and deletes their Firebase Auth account (Apple App Store Guideline 5.1.1(v) compliance).
+ */
+export async function deleteUserAccountAndCloudData(): Promise<void> {
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error('Kein angemeldetes Konto gefunden.');
+  }
+  const uid = user.uid;
+
+  try {
+    const idToken = await user.getIdToken();
+    const base = resolveApiBaseUrl();
+    await fetch(`${base}/api/user-sync/delete-account`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+    }).catch(() => {});
+  } catch {
+    // Continue with client cleanup
+  }
+
+  try {
+    const [wlSnap, progSnap] = await Promise.all([
+      getDocs(query(collection(db, 'users', uid, 'watchlist'), where('uid', '==', uid), limit(500))).catch(() => null),
+      getDocs(query(collection(db, 'users', uid, 'progress'), where('uid', '==', uid), limit(500))).catch(() => null),
+    ]);
+    const deletes: Promise<unknown>[] = [];
+    wlSnap?.forEach((d) => deletes.push(deleteDoc(d.ref).catch(() => {})));
+    progSnap?.forEach((d) => deletes.push(deleteDoc(d.ref).catch(() => {})));
+    deletes.push(deleteDoc(doc(db, 'userLibraryVault', uid)).catch(() => {}));
+    deletes.push(deleteDoc(doc(db, 'userSecurityVault', uid)).catch(() => {}));
+    deletes.push(deleteDoc(doc(db, 'users', uid)).catch(() => {}));
+    await Promise.allSettled(deletes);
+  } catch {
+    // Ignore partial Firestore cleanup errors
+  }
+
+  if (typeof window !== 'undefined') {
+    try {
+      localStorage.removeItem(getLocalLibrarySyncTsKey(uid));
+      sessionStorage.removeItem(getTwoFactorTicketStorageKey(uid));
+    } catch {
+      // ignore
+    }
+  }
+
+  try {
+    await deleteUser(user);
+  } catch (err: any) {
+    // If Firebase requires recent login for Auth record deletion, sign out after wiping all cloud & profile data
+    const code = String(err?.code || '');
+    if (code.includes('auth/requires-recent-login')) {
+      await signOut(auth);
+      return;
+    }
+    await signOut(auth).catch(() => {});
+  }
+}
+
+/**
+ * Pushes the complete current library snapshot to both the Server Sync Vault AND the atomic
+ * Firestore /userLibraryVault/{uid} document so every device & URL stays 100% synchronized.
+ */
+export async function syncFullLibrarySnapshotToCloud(
+  uid: string,
+  snapshot: {
+    watchlist: MediaItem[];
+    watchedMovies: number[];
+    manuallyWatchedShows: number[];
+    watchedEpisodes: Record<number, number[]>;
+    removedWatchlistKeys?: Record<string, number>;
+    removedMovies?: Record<string, number>;
+    removedShows?: Record<string, number>;
+  }
+): Promise<void> {
+  if (!uid) return;
+  const compactedWatchlist = (snapshot.watchlist || []).slice(0, 500).map(compactMediaItemForSync);
+  await Promise.all([
+    pushServerUserSyncState({
+      library: {
+        watchlist: compactedWatchlist,
+        removedWatchlistKeys: snapshot.removedWatchlistKeys || {},
+        watchedMovies: (snapshot.watchedMovies || []).slice(0, 500),
+        removedMovies: snapshot.removedMovies || {},
+        manuallyWatchedShows: (snapshot.manuallyWatchedShows || []).slice(0, 500),
+        removedShows: snapshot.removedShows || {},
+        watchedEpisodes: snapshot.watchedEpisodes || {},
+        updatedAt: new Date().toISOString(),
+      },
+    }),
+    saveUserLibraryVaultFirestore(uid, {
+      watchlist: compactedWatchlist,
+      removedWatchlistKeys: snapshot.removedWatchlistKeys,
+      watchedMovies: snapshot.watchedMovies,
+      removedMovies: snapshot.removedMovies,
+      manuallyWatchedShows: snapshot.manuallyWatchedShows,
+      removedShows: snapshot.removedShows,
+      watchedEpisodes: snapshot.watchedEpisodes,
+    }),
+  ]);
 }
 
 export function combineLibrarySnapshots(
@@ -1020,15 +1373,25 @@ export function combineLibrarySnapshots(
     watchedMovies?: number[];
     manuallyWatchedShows?: number[];
     watchedEpisodes?: Record<number, number[]>;
-  } | null
+  } | null,
+  vaultLib?: Partial<SyncedLibrarySnapshot> | null
 ): SyncedLibrarySnapshot {
   const removedWatchlistKeys: Record<string, number> = {
+    ...(vaultLib?.removedWatchlistKeys || {}),
     ...(serverLib?.removedWatchlistKeys || {}),
   };
+  for (const [k, v] of Object.entries(vaultLib?.removedWatchlistKeys || {})) {
+    if (Number(v) > (removedWatchlistKeys[k] || 0)) {
+      removedWatchlistKeys[k] = Number(v);
+    }
+  }
+
   const removedMovies: Record<string, number> = {
+    ...(vaultLib?.removedMovies || {}),
     ...(serverLib?.removedMovies || {}),
   };
   const removedShows: Record<string, number> = {
+    ...(vaultLib?.removedShows || {}),
     ...(serverLib?.removedShows || {}),
   };
 
@@ -1039,20 +1402,27 @@ export function combineLibrarySnapshots(
       if (!item || !item.id || item.id <= 0) continue;
       const mType: 'movie' | 'tv' = resolveMediaType(item) === 'tv' ? 'tv' : 'movie';
       const key = toFirestoreMediaKey(item.id, mType);
-      if (removedWatchlistKeys[key]) continue;
+      const removedAt = Number(removedWatchlistKeys[key] || 0);
+      const addedAt = Number((item as any)._addedAtMs || 0);
+      if (removedAt > 0 && addedAt <= removedAt) continue;
+      if (removedAt > 0 && addedAt > removedAt) {
+        delete removedWatchlistKeys[key];
+      }
       if (!wlMap.has(key)) {
         wlMap.set(key, { ...item, media_type: mType });
       }
     }
   };
 
-  // Priority order: Firestore -> Server Sync Vault -> Local unmerged items
+  // Priority order: Atomic Firestore Vault -> Firestore Subcollections -> Server Sync Vault -> Local unmerged items
+  addItems(vaultLib?.watchlist);
   addItems(firestoreSnap.watchlist);
   addItems(serverLib?.watchlist);
   addItems(localLib?.watchlist);
 
   const movieSet = new Set<number>();
   for (const id of [
+    ...(vaultLib?.watchedMovies || []),
     ...(firestoreSnap.watchedMovies || []),
     ...(serverLib?.watchedMovies || []),
     ...(localLib?.watchedMovies || []),
@@ -1065,6 +1435,7 @@ export function combineLibrarySnapshots(
 
   const showSet = new Set<number>();
   for (const id of [
+    ...(vaultLib?.manuallyWatchedShows || []),
     ...(firestoreSnap.manuallyWatchedShows || []),
     ...(serverLib?.manuallyWatchedShows || []),
     ...(localLib?.manuallyWatchedShows || []),
@@ -1091,6 +1462,7 @@ export function combineLibrarySnapshots(
     }
   };
 
+  mergeEpSource(vaultLib?.watchedEpisodes);
   mergeEpSource(firestoreSnap.watchedEpisodes);
   mergeEpSource(normalizeEpisodeRecord(serverLib?.watchedEpisodes as any));
   mergeEpSource(localLib?.watchedEpisodes);
@@ -1113,6 +1485,7 @@ export async function fetchLibrarySubcollectionsOnce(uid: string): Promise<{
   watchedEpisodes: Record<number, number[]>;
 }> {
   const serverPromise = fetchServerUserSyncState().catch(() => null);
+  const vaultPromise = fetchUserLibraryVaultFirestore(uid).catch(() => null);
 
   let firestoreData = {
     watchlist: [] as MediaItem[],
@@ -1122,8 +1495,16 @@ export async function fetchLibrarySubcollectionsOnce(uid: string): Promise<{
   };
 
   try {
-    const watchlistQ = query(collection(db, 'users', uid, 'watchlist'), where('uid', '==', uid));
-    const progressQ = query(collection(db, 'users', uid, 'progress'), where('uid', '==', uid));
+    const watchlistQ = query(
+      collection(db, 'users', uid, 'watchlist'),
+      where('uid', '==', uid),
+      limit(500)
+    );
+    const progressQ = query(
+      collection(db, 'users', uid, 'progress'),
+      where('uid', '==', uid),
+      limit(500)
+    );
 
     const [wlSnap, progSnap] = await Promise.all([getDocs(watchlistQ), getDocs(progressQ)]);
     costMetrics.sessionReads += Math.max(1, wlSnap.size) + Math.max(1, progSnap.size);
@@ -1169,8 +1550,13 @@ export async function fetchLibrarySubcollectionsOnce(uid: string): Promise<{
     }
   }
 
-  const serverState = await serverPromise;
-  const combined = combineLibrarySnapshots(firestoreData, serverState?.library || null, null);
+  const [serverState, vaultState] = await Promise.all([serverPromise, vaultPromise]);
+  const combined = combineLibrarySnapshots(
+    firestoreData,
+    serverState?.library || null,
+    null,
+    vaultState
+  );
   return {
     watchlist: combined.watchlist,
     watchedMovies: combined.watchedMovies,
@@ -1180,8 +1566,8 @@ export async function fetchLibrarySubcollectionsOnce(uid: string): Promise<{
 }
 
 /**
- * Real-Time Account Library Subscription (Firestore onSnapshot + Server Sync Vault)
- * Keeps 2, 3, or any number of devices logged into the same account UID in sync in real time.
+ * Real-Time Account Library Subscription (Atomic /userLibraryVault/{uid} + Subcollections + Server Sync Vault)
+ * Keeps iPhone, Laptop, Hisense VIDAA Smart TV, ais-dev, and ais-pre in sync in real time.
  */
 export function subscribeToUserLibraryRealtime(
   uid: string,
@@ -1197,6 +1583,7 @@ export function subscribeToUserLibraryRealtime(
   let latestFirestoreShows: number[] = [];
   let latestFirestoreEps: Record<number, number[]> = {};
   let latestServerLib: Record<string, any> | null = null;
+  let latestVaultLib: Partial<SyncedLibrarySnapshot> | null = null;
   let lastEmittedJson = '';
   let active = true;
 
@@ -1209,13 +1596,18 @@ export function subscribeToUserLibraryRealtime(
         manuallyWatchedShows: latestFirestoreShows,
         watchedEpisodes: latestFirestoreEps,
       },
-      latestServerLib
+      latestServerLib,
+      null,
+      latestVaultLib
     );
     const payload = {
       watchlist: merged.watchlist,
       watchedMovies: merged.watchedMovies,
       manuallyWatchedShows: merged.manuallyWatchedShows,
       watchedEpisodes: merged.watchedEpisodes,
+      removedWatchlistKeys: merged.removedWatchlistKeys,
+      removedMovies: merged.removedMovies,
+      removedShows: merged.removedShows,
     };
     try {
       const nextJson = JSON.stringify(payload);
@@ -1227,17 +1619,84 @@ export function subscribeToUserLibraryRealtime(
     onLibraryUpdate(payload);
   };
 
-  const pullServerVault = async () => {
-    const s = await fetchServerUserSyncState();
-    if (!active || !s?.library) return;
-    latestServerLib = s.library;
+  const pullServerAndVault = async () => {
+    const [s, v] = await Promise.all([
+      fetchServerUserSyncState().catch(() => null),
+      fetchUserLibraryVaultFirestore(uid).catch(() => null),
+    ]);
+    if (!active) return;
+    if (s?.library) latestServerLib = s.library;
+    if (v) latestVaultLib = v;
     emitCombined();
   };
 
-  pullServerVault();
+  pullServerAndVault();
 
-  const watchlistQ = query(collection(db, 'users', uid, 'watchlist'), where('uid', '==', uid));
-  const progressQ = query(collection(db, 'users', uid, 'progress'), where('uid', '==', uid));
+  // 1. Real-time listener on atomic 1-Doc /userLibraryVault/{uid} (cross-origin & cross-container source of truth)
+  const unsubVault = onSnapshot(
+    doc(db, 'userLibraryVault', uid),
+    (snap) => {
+      if (!active || !snap.exists()) return;
+      try {
+        const data = snap.data();
+        if (data && typeof data.libraryJson === 'string') {
+          const parsed = JSON.parse(data.libraryJson);
+          if (parsed && typeof parsed === 'object') {
+            latestVaultLib = {
+              watchlist: Array.isArray(parsed.watchlist) ? parsed.watchlist : [],
+              removedWatchlistKeys: parsed.removedWatchlistKeys || {},
+              watchedMovies: Array.isArray(parsed.watchedMovies) ? parsed.watchedMovies : [],
+              removedMovies: parsed.removedMovies || {},
+              manuallyWatchedShows: Array.isArray(parsed.manuallyWatchedShows)
+                ? parsed.manuallyWatchedShows
+                : [],
+              removedShows: parsed.removedShows || {},
+              watchedEpisodes: normalizeEpisodeRecord(parsed.watchedEpisodes),
+            };
+            // Also prune any deleted items from cached latestServerLib / latestFirestoreWl immediately
+            const tombstones = latestVaultLib.removedWatchlistKeys || {};
+            if (Object.keys(tombstones).length > 0) {
+              latestFirestoreWl = latestFirestoreWl.filter((item) => {
+                const mType = resolveMediaType(item) === 'tv' ? 'tv' : 'movie';
+                const k = toFirestoreMediaKey(item.id, mType);
+                return !tombstones[k];
+              });
+              if (latestServerLib?.watchlist) {
+                latestServerLib = {
+                  ...latestServerLib,
+                  watchlist: latestServerLib.watchlist.filter((item) => {
+                    const mType = resolveMediaType(item) === 'tv' ? 'tv' : 'movie';
+                    const k = toFirestoreMediaKey(item.id, mType);
+                    return !tombstones[k];
+                  }),
+                  removedWatchlistKeys: {
+                    ...(latestServerLib.removedWatchlistKeys || {}),
+                    ...tombstones,
+                  },
+                };
+              }
+            }
+            emitCombined();
+          }
+        }
+      } catch {
+        // ignore parse errors
+      }
+    },
+    () => {}
+  );
+
+  // 2. Real-time listeners on subcollections (bounded to 500 items)
+  const watchlistQ = query(
+    collection(db, 'users', uid, 'watchlist'),
+    where('uid', '==', uid),
+    limit(500)
+  );
+  const progressQ = query(
+    collection(db, 'users', uid, 'progress'),
+    where('uid', '==', uid),
+    limit(500)
+  );
 
   const unsubWl = onSnapshot(
     watchlistQ,
@@ -1263,7 +1722,7 @@ export function subscribeToUserLibraryRealtime(
       emitCombined();
     },
     () => {
-      pullServerVault();
+      pullServerAndVault();
     }
   );
 
@@ -1292,27 +1751,28 @@ export function subscribeToUserLibraryRealtime(
       emitCombined();
     },
     () => {
-      pullServerVault();
+      pullServerAndVault();
     }
   );
 
-  // Periodic & focus-triggered server vault sync so multi-device changes propagate even if Firestore write quota is paused
+  // Focus-triggered & fast periodic sync fallback (every 4s while visible)
   const pollTimer =
     typeof window !== 'undefined'
       ? window.setInterval(() => {
           if (document.visibilityState === 'visible') {
-            pullServerVault();
+            pullServerAndVault();
           }
-        }, 10000)
+        }, 4000)
       : null;
 
-  const onFocus = () => pullServerVault();
+  const onFocus = () => pullServerAndVault();
   if (typeof window !== 'undefined') {
     window.addEventListener('focus', onFocus);
   }
 
   return () => {
     active = false;
+    unsubVault();
     unsubWl();
     unsubProg();
     if (pollTimer !== null && typeof window !== 'undefined') {
@@ -1338,12 +1798,12 @@ export async function saveWatchlistItemFirestore(
   if (!skipTimestampBump) {
     pushServerUserSyncState({
       library: {
-        watchlist: [{ ...item, media_type: mType, _addedAtMs: Date.now() }],
+        watchlist: [compactMediaItemForSync({ ...item, media_type: mType, _addedAtMs: Date.now() } as any)],
       },
     }).catch(() => {});
   }
 
-  if (isWriteQuotaExhausted()) {
+  if (!canPerformClientFirestoreWrite()) {
     return;
   }
 
@@ -1405,7 +1865,7 @@ export async function deleteWatchlistItemFirestore(
     }).catch(() => {});
   }
 
-  if (isWriteQuotaExhausted()) {
+  if (!canPerformClientFirestoreWrite()) {
     return;
   }
 
@@ -1458,7 +1918,7 @@ export async function saveWatchProgressFirestore(
     }
   }
 
-  if (isWriteQuotaExhausted()) {
+  if (!canPerformClientFirestoreWrite()) {
     return;
   }
 
@@ -1508,81 +1968,126 @@ export async function mergeLocalLibraryIntoFirestore(
   manuallyWatchedShows: number[];
   watchedEpisodes: Record<number, number[]>;
 }> {
-  // 1. Fetch existing cloud state (Firestore + Server Sync Vault)
-  const existingCloud = await fetchLibrarySubcollectionsOnce(uid);
-  const serverState = await fetchServerUserSyncState();
+  // 1. Fetch existing cloud state across all 3 cloud layers in parallel:
+  //    - Atomic 1-Doc Firestore /userLibraryVault/{uid}
+  //    - Firestore /users/{uid}/watchlist & /progress subcollections
+  //    - Express Server Sync Vault (/api/user-sync/state)
+  const [existingCloud, serverState, vaultState] = await Promise.all([
+    fetchLibrarySubcollectionsOnce(uid),
+    fetchServerUserSyncState().catch(() => null),
+    fetchUserLibraryVaultFirestore(uid).catch(() => null),
+  ]);
 
   // 2. Union-merge local device items with existing cloud items (respecting tombstones)
-  const combined = combineLibrarySnapshots(existingCloud, serverState?.library || null, {
-    watchlist: localWatchlist,
-    watchedMovies: localWatchedMovies,
-    manuallyWatchedShows: localManuallyWatchedShows,
-    watchedEpisodes: localWatchedEpisodes,
-  });
-
-  // 3. Push the unified library to Server Sync Vault
-  await pushServerUserSyncState({
-    library: {
-      watchlist: combined.watchlist.slice(0, 500),
-      removedWatchlistKeys: combined.removedWatchlistKeys,
-      watchedMovies: combined.watchedMovies.slice(0, 500),
-      removedMovies: combined.removedMovies,
-      watchedEpisodes: combined.watchedEpisodes,
-      manuallyWatchedShows: combined.manuallyWatchedShows.slice(0, 500),
-      removedShows: combined.removedShows,
-      updatedAt: new Date().toISOString(),
+  const combined = combineLibrarySnapshots(
+    existingCloud,
+    serverState?.library || null,
+    {
+      watchlist: localWatchlist,
+      watchedMovies: localWatchedMovies,
+      manuallyWatchedShows: localManuallyWatchedShows,
+      watchedEpisodes: localWatchedEpisodes,
     },
-  });
+    vaultState
+  );
 
-  // 4. Write only missing local items to Firestore subcollections so we don't waste writes
-  if (!isWriteQuotaExhausted()) {
-    const existingCloudWlKeys = new Set(
-      existingCloud.watchlist.map((i) => toFirestoreMediaKey(i.id, resolveMediaType(i)))
-    );
-    const existingCloudMovies = new Set(existingCloud.watchedMovies);
-    const existingCloudShows = new Set(existingCloud.manuallyWatchedShows);
+  // 3. Push the unified library atomically to BOTH /userLibraryVault/{uid} and /api/user-sync/state
+  await syncFullLibrarySnapshotToCloud(uid, combined);
 
-    let wroteAny = false;
+  // 4. Batch-write any missing items to Firestore subcollections using writeBatch (max 500 ops)
+  if (!isWriteQuotaExhausted() && canPerformClientFirestoreWrite()) {
+    try {
+      const existingCloudWlKeys = new Set(
+        existingCloud.watchlist.map((i) => toFirestoreMediaKey(i.id, resolveMediaType(i)))
+      );
+      const existingCloudMovies = new Set(existingCloud.watchedMovies);
+      const existingCloudShows = new Set(existingCloud.manuallyWatchedShows);
 
-    for (const item of combined.watchlist.slice(0, 120)) {
-      if (isWriteQuotaExhausted()) break;
-      const k = toFirestoreMediaKey(item.id, resolveMediaType(item));
-      if (!existingCloudWlKeys.has(k)) {
-        await saveWatchlistItemFirestore(uid, item, true);
-        wroteAny = true;
+      const batch = writeBatch(db);
+      let opCount = 0;
+
+      for (const item of combined.watchlist.slice(0, 120)) {
+        if (opCount >= 450) break;
+        const mType: 'movie' | 'tv' = resolveMediaType(item) === 'tv' ? 'tv' : 'movie';
+        const mediaKey = toFirestoreMediaKey(item.id, mType);
+        if (!existingCloudWlKeys.has(mediaKey)) {
+          const ref = doc(db, 'users', uid, 'watchlist', mediaKey);
+          batch.set(ref, {
+            uid,
+            mediaKey,
+            mediaId: Number(item.id),
+            mediaType: mType,
+            title: (item.title || item.name || 'Untitled').slice(0, 300),
+            posterPath: (item.poster_path || '').slice(0, 300),
+            backdropPath: (item.backdrop_path || '').slice(0, 300),
+            releaseDate: (item.release_date || item.first_air_date || '').slice(0, 30),
+            voteAverage: Math.min(10, Math.max(0, Number(item.vote_average || 0))),
+            overview: (item.overview || '').slice(0, 2000),
+            addedAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+          opCount += 1;
+        }
       }
-    }
 
-    for (const movieId of combined.watchedMovies.slice(0, 150)) {
-      if (isWriteQuotaExhausted()) break;
-      if (!existingCloudMovies.has(movieId)) {
-        await saveWatchProgressFirestore(uid, movieId, 'movie', true, [], true);
-        wroteAny = true;
+      for (const movieId of combined.watchedMovies.slice(0, 150)) {
+        if (opCount >= 450) break;
+        if (!existingCloudMovies.has(movieId)) {
+          const mediaKey = toFirestoreMediaKey(movieId, 'movie');
+          const ref = doc(db, 'users', uid, 'progress', mediaKey);
+          batch.set(ref, {
+            uid,
+            mediaKey,
+            mediaId: Number(movieId),
+            mediaType: 'movie',
+            isCompleted: true,
+            watchedEpisodes: [],
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+          opCount += 1;
+        }
       }
-    }
 
-    const allTvIds = new Set<number>([
-      ...combined.manuallyWatchedShows,
-      ...Object.keys(combined.watchedEpisodes).map(Number),
-    ]);
+      const allTvIds = new Set<number>([
+        ...combined.manuallyWatchedShows,
+        ...Object.keys(combined.watchedEpisodes).map(Number),
+      ]);
 
-    for (const tvId of Array.from(allTvIds).slice(0, 120)) {
-      if (isWriteQuotaExhausted()) break;
-      if (!tvId || tvId <= 0) continue;
-      const isCompleted = combined.manuallyWatchedShows.includes(tvId);
-      const eps = combined.watchedEpisodes[tvId] || [];
-      const prevEps = existingCloud.watchedEpisodes[tvId] || [];
-      if (
-        (isCompleted && !existingCloudShows.has(tvId)) ||
-        eps.length !== prevEps.length
-      ) {
-        await saveWatchProgressFirestore(uid, tvId, 'tv', isCompleted, eps, true);
-        wroteAny = true;
+      for (const tvId of Array.from(allTvIds).slice(0, 120)) {
+        if (opCount >= 450) break;
+        if (!tvId || tvId <= 0) continue;
+        const isCompleted = combined.manuallyWatchedShows.includes(tvId);
+        const eps = (combined.watchedEpisodes[tvId] || [])
+          .filter((n) => typeof n === 'number' && Number.isFinite(n))
+          .slice(0, 500);
+        const prevEps = existingCloud.watchedEpisodes[tvId] || [];
+        if ((isCompleted && !existingCloudShows.has(tvId)) || eps.length !== prevEps.length) {
+          const mediaKey = toFirestoreMediaKey(tvId, 'tv');
+          const ref = doc(db, 'users', uid, 'progress', mediaKey);
+          batch.set(ref, {
+            uid,
+            mediaKey,
+            mediaId: Number(tvId),
+            mediaType: 'tv',
+            isCompleted: Boolean(isCompleted),
+            watchedEpisodes: eps,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+          opCount += 1;
+        }
       }
-    }
 
-    if (wroteAny && !isWriteQuotaExhausted()) {
-      await bumpUserLibrarySyncTimestamp(uid);
+      if (opCount > 0) {
+        costMetrics.sessionWrites += opCount;
+        await batch.commit();
+        await bumpUserLibrarySyncTimestamp(uid);
+      }
+    } catch (error) {
+      if (isFirestoreQuotaError(error)) {
+        markWriteQuotaExhausted();
+      }
     }
   }
 

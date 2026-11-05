@@ -282,8 +282,13 @@ export const AuthView: React.FC<AuthViewProps> = ({
         ? 'Zu viele Anmeldeversuche. Bitte warte einen kurzen Moment.'
         : 'Too many attempts. Please wait a moment and try again.';
     }
+    if (code.includes('auth/unauthorized-domain')) {
+      return isDe
+        ? 'Domain in Firebase noch nicht für Popups freigegeben. Bitte nutze den 6-stelligen Code oder E-Mail-Login.'
+        : 'This domain is not authorized for OAuth popups yet. Please use the 6-digit code or Email login.';
+    }
     return isDe
-      ? 'Anmeldung fehlgeschlagen. Bitte überprüfe deine Eingaben.'
+      ? 'Anmeldung fehlgeschlagen. Bitte überprüfe deine Eingaben oder nutze den 6-stelligen Geräte-Code.'
       : 'Authentication failed. Please try again.';
   };
 
@@ -307,24 +312,23 @@ export const AuthView: React.FC<AuthViewProps> = ({
   };
 
   const handleOAuth = async (provider: 'google' | 'apple') => {
+    // Invoke loginWithGoogle / loginWithApple synchronously BEFORE React state updates so iPhone Safari preserves the transient user gesture activation for window.open()
+    const authPromise = provider === 'google' ? loginWithGoogle() : loginWithApple();
     setErrorMessage(null);
     setInfoMessage(null);
     setBusyProvider(provider);
     try {
-      if (provider === 'google') {
-        const res = await loginWithGoogle();
-        if (res) {
-          await checkTwoFactorGateAfterLogin(
-            isDe ? 'Mit Google angemeldet' : 'Signed in with Google'
-          );
-        }
-      } else {
-        const res = await loginWithApple();
-        if (res) {
-          await checkTwoFactorGateAfterLogin(
-            isDe ? 'Mit Apple angemeldet' : 'Signed in with Apple'
-          );
-        }
+      const res = await authPromise;
+      if (res) {
+        await checkTwoFactorGateAfterLogin(
+          provider === 'google'
+            ? isDe
+              ? 'Mit Google angemeldet'
+              : 'Signed in with Google'
+            : isDe
+            ? 'Mit Apple angemeldet'
+            : 'Signed in with Apple'
+        );
       }
     } catch (err) {
       setErrorMessage(mapFirebaseError(err));
@@ -817,7 +821,7 @@ export const AuthView: React.FC<AuthViewProps> = ({
                   </span>
                 </button>
 
-                {/* Smart TV / VIDAA QR-Code Login Button */}
+                {/* Cross-Device 6-Digit Code / QR Login Button (works for Smart TV & iPhone) */}
                 <button
                   type="button"
                   tabIndex={isLoginVisible ? 0 : -1}
@@ -835,8 +839,8 @@ export const AuthView: React.FC<AuthViewProps> = ({
                   <Tv size={15} className="flex-shrink-0 text-white/80" />
                   <span className="truncate">
                     {isDe
-                      ? 'Smart TV / VIDAA QR-Code Login'
-                      : 'Smart TV / VIDAA QR Code Sign-In'}
+                      ? 'Per 6-stelligem Code / QR koppeln (iPhone & TV)'
+                      : 'Sign in with 6-Digit Code / QR (iPhone & TV)'}
                   </span>
                 </button>
               </div>

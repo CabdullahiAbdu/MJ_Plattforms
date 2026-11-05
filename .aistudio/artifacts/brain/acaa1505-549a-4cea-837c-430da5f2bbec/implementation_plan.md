@@ -1,83 +1,132 @@
-# MovieJournal — Production Launch, Security-Härtung & Multi-Zyklus Test-Plan
+# MovieJournal – Launch-Architektur, UX-Feinschliff & Dual-Release-Plan (PWA + App Store)
 
-Dieser Plan macht **MovieJournal** in allen Schichten (UI/UX, Frontend-Effizienz, Express-Backend, Firestore-Security, Google-Cloud-Kostenschutz und automatisierte Qualitätssicherung) bereit für den echten Nutzer-Launch auf Smartphone (iOS/Android), Desktop und Smart TV (Hisense VIDAA OS).
+Dieser Plan schließt alle verbleibenden Infrastruktur-, Synchronisations- und UI/UX-Lücken vor dem finalen Produktiv-Launch – sowohl als installierbare Web-App (iOS/Android PWA & Hisense Smart TV) als auch für einen nativen App-Store-Release via Capacitor.
 
----
+## User Review & Critical Decisions
 
-## 1. UI-Aufräumen für echte Endnutzer (Zero-Developer-Clutter)
+> [!IMPORTANT]
+> Basierend auf deiner Auswahl bereiten wir beide Release-Kanäle parallel vor und fokussieren das UI-Update gezielt auf ein absolut ruhiges, verzögerungs- und ruckelfreies Nutzererlebnis (CLS = 0) bei Serien-Staffeln und Detailansichten.
 
-Alle internen Entwickler-, Admin- und Infrastruktur-Bedienelemente werden vollständig aus der Benutzeroberfläche entfernt, sodass echte Nutzer ausschließlich ein aufgeräumtes Consumer-Produkt sehen:
-
-- **`views/SettingsView.tsx`**:
-  - Vollständige Entfernung des **TMDB Multi-Key Failover-Pool**-Menüpunkts, des Key-Verwaltungs-Sheets (`activeSheet === 'keyPool'`) sowie sämtlicher Client-Aufrufe an `/api/admin/tmdb-keys`.
-  - Vollständige Entfernung des Entwickler-Links zum **Firebase Blaze-Plan & Cloud-Billing-Dashboard** aus dem Profilbereich.
-  - Vollständige Entfernung nicht genutzter Entwickler-Props (`triggerFullTestFlow`, `onReopenOnboarding`, `replayIntro`, `serverCacheStats`, `refreshServerStats`, `onClearApiCache`) aus `SettingsViewProps`, `App.tsx` und `ConfigContext.tsx`.
-  - Beibehaltung der für echte Nutzer relevanten Funktionen: **Konto-Watchlist jetzt synchronisieren**, **Zwei-Faktor-Authentifizierung (2FA)**, **Smart TV per 6-stelligem Code koppeln**, **Streaming-Dienste, Region & Sprache**, **Akzentfarbe** sowie **JSON-Backup Export/Import & Mediathek-Reset**.
-
----
-
-## 2. Volle Security-Härtung (Backend-API & Firestore Rules)
-
-### 2.1 Express-Backend (`server.ts`)
-- **HTTP-Security-Header**:
-  - `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`, `Strict-Transport-Security: max-age=31536000; includeSubDomains` (für HTTPS).
-- **Gestaffeltes Rate-Limiting (Bot- & Brute-Force-Schutz)**:
-  - **Auth & 2FA (`/api/auth/*`)**: Max. **20 Requests / Minute pro IP** (verhindert Brute-Force-Angriffe auf 6-stellige TOTP- und TV-Kopplungs-Codes).
-  - **Gemini AI (`/api/ai/*`)**: Max. **15 Requests / Minute pro IP** + strikte Längenbegrenzung des Prompts (max. 1.200 Zeichen).
-  - **User Cloud Sync (`/api/user-sync/*`)**: Max. **60 Requests / Minute pro Nutzer/IP** mit Payload-Validierung.
-  - **TMDB-Katalog (`/api/tmdb/*`)**: Max. **360 Requests / Minute pro IP** (durch L1-Cache und Singleflight-Coalescing für echte Nutzer verzögerungsfrei).
-  - Automatische Speicherbereinigung abgelaufener Rate-Limit-Buckets alle 5 Minuten (Schutz vor Memory-Leaks).
-- **Strikte Token- & Admin-Absicherung**:
-  - Die verbleibenden Server-Admin-Endpunkte (`/api/admin/tmdb-keys`) werden im Backend strikt auf den verifizierten Owner-Account (`infoc232@gmail.com`) beschränkt (`403 Forbidden` für alle anderen).
-  - Kryptografischer `timingSafeEqual`-Vergleich ohne Längen-Leak bei 2FA-Session-Tickets und TV-Poll-Secrets.
-
-### 2.2 Firestore Security Rules (`firestore.rules` & `firebase-blueprint.json`)
-- **Strikte Mandantentrennung (Zero-Trust User Isolation)**:
-  - `/users/{userId}` sowie alle Subcollections (`/watchlist/{itemId}`, `/progress/{itemId}`) sind ausnahmslos für `isOwner(userId)` (`request.auth != null && request.auth.uid == userId`) les- und schreibbar.
-  - Strikte Schema-, Typ- und Größenvalidierung für jedes Dokument (`isValidUserProfile`, `isValidWatchlistItem`, `isValidWatchProgress`).
-- **Härtung der System-Collections**:
-  - `list`- und `delete`-Operationen auf `/serverKeyVault`, `/userSecurityVault`, `/regionalCache` und `/tmdbProxyQueue` bleiben komplett gesperrt (`allow list, delete: if false`), sodass kein Auslesen fremder Datensätze möglich ist.
-  - Deployment und Validierung der aktualisierten Regeln über ESLint (`@firebase/rules-unit-testing`) und `DeployRules`.
+- **Bestätigte Entscheidung 1 (Deployment-Ziel)**: **Parallel-Vorbereitung für PWA / Smart TV WebApp und nativen Apple App Store / Google Play Build (Capacitor)** inklusive produktionsreifer Native-Bridge-Konfiguration, Deep-Link-Routing, Safe-Area-Steuerung und Offline-Support.
+- **Bestätigte Entscheidung 2 (UI/UX-Fokus)**: **Layout-Shift-freie Skeletons für Staffel-Episodenlisten** mit festen `16:9`-Bildproportionen, reservierten Container-Höhen beim Staffelwechsel und weichen Crossfade-Übergängen ohne Springen des Inhalts.
+- **Empfohlene Infrastruktur-Standards (inkludiert)**:
+  1. **Offline-fähiger Service Worker** für sofortigen App-Start im Flugmodus/Funkloch samt gecachter Watchlist & Kalender-Ansicht.
+  2. **Multi-Instanz-sichere Cloud-Persistenz für den TMDB-Key-Pool**, damit Cloud-Run-Instanzen bei Auto-Scaling oder Kaltstarts keine im Admin-Dashboard hinterlegten API-Keys verlieren.
+  3. **Episoden-Tombstones im Multi-Device-Sync**, damit abgewählte Serien-Episoden auf Zweitgeräten zuverlässig abgewählt bleiben.
+  4. **Echtes History-Stack-Verhalten für Detail-Ansichten**, damit die Zurück-Geste auf iPhone, Android und Smart-TV immer zuerst das geöffnete Film-/Serien-Detail schließt, statt die App zu verlassen.
 
 ---
 
-## 3. Cloud-Infrastruktur, Multi-Device-Sync & Automatischer Kosten-/Quota-Wächter
+## 1. Overview & Core Concept
 
-Damit die App zu **100 % durch das kostenlose Google-Cloud-/Firestore-Kontingent bzw. dein Startguthaben** gedeckt bleibt und niemals unkontrollierte Kosten verursacht:
-
-- **Automatischer Tages-Budget-Wächter (`DailyCloudQuotaGuard`)**:
-  - Überwacht im Server und Client die täglichen Firestore-Schreib-/Lesevorgänge sowie Gemini-AI-Aufrufe mit einem konservativen Sicherheits-Deckel innerhalb des kostenlosen Tagessockels.
-  - Bei Erreichen des Tagesschwellenwerts schaltet die App nahtlos und unterbrechungsfrei auf den **Encrypted Server Sync Vault (`/api/user-sync/state` + Disk-Snapshot)** um — für den Nutzer bleibt der Sync über alle Geräte zu 100 % aktiv, ohne dass ein einziger kostenpflichtiger Cloud-Call entsteht.
-- **Verlustfreier Multi-Device Account Sync (`services/firebase.ts` & `server.ts`)**:
-  - Deterministischer **CRDT-Tombstone-Merge** über alle angemeldeten Geräte (iPhone, Laptop, Hisense Smart TV):
-    - Hinzugefügte Filme/Serien und gesehene Episoden werden geräteübergreifend zusammengeführt.
-    - Explizite Löschungen (`removedWatchlistKeys`, `removedMovies`, `removedShows`) setzen sich sauber durch, damit gelöschte Einträge nicht von einem anderen Gerät wiederhergestellt werden.
-    - Alle Nutzer-Sync-Daten im Server-Vault (`user-cloud-sync-vault.json`) werden zusätzlich mit **AES-256-GCM** at-rest verschlüsselt gespeichert.
+- **Was geliefert wird**: Eine gegen Kaltstarts, Funklöcher, Multi-Geräte-Races und Layout-Sprünge gehärtete Release-Version von MovieJournal, die ohne Code-Umbau sowohl im Browser/Home-Screen/TV als auch im nativen Capacitor-Container für den Apple App Store und Google Play Store läuft.
+- **Zielgruppe & Nutzungskontext**: Film- und Serien-Enthusiasten auf dem iPhone (unterwegs, oft mit wechselndem Mobilfunknetz), auf dem Desktop/Tablet sowie im Wohnzimmer am Hisense VIDAA Smart TV.
+- **Kernmehrwert**:
+  - **Null Layout-Shifts (CLS = 0)** beim Blättern durch Serien-Staffeln und beim Nachladen von Episodenbildern.
+  - **100 % Offline-Verfügbarkeit** der eigenen Bibliothek (Watchlist, gesehene Filme/Episoden, Erscheinungskalender).
+  - **Zustandslose Cloud-Run-Skalierbarkeit** ohne Datenverlust bei Container-Neustarts.
 
 ---
 
-## 4. Code-Effizienz & Smart-TV / Mobile Performance-Optimierung
+## 2. User Experience & Visual Design
 
-- **Frontend-Speicher- & Render-Disziplin**:
-  - Deduplizierte State-Updates in `useLocalStorage` und `LibraryContext`, um unnötige Re-Renders der `MovieRow`-Listen zu verhindern.
-  - Strikte Begrenzung des Client-Speicher-Caches in `services/tmdb.ts` (LRU-Eviction ab 400 Einträgen), damit der RAM auf dem Hisense Smart TV auch bei langen Sessions stabil bleibt.
-  - Hardware-beschleunigtes Zeilen-Scrolling und ausfallsichere D-Pad-Navigation (`useSpatialNavigation.ts`) ohne Layout-Thrashing.
+- **Key User Flows**:
+  1. **Serien-Staffelwechsel ohne Layout-Sprung**: Tippt der Nutzer im Serien-Detail auf eine andere Staffel (z. B. Staffel 1 → Staffel 2), behält der Episoden-Container exakt seine vertikale Geometrie. Statt kurz einzuklappen oder zu flackern, erscheint sofort ein maßstabsgetreues Episoden-Skeleton-Raster (16:9-Stills, Titelzeile, Laufzeit-Badge, Beschreibung und Haken-Button), das nach dem Laden sanft per Opacity-Crossfade in die echten Episodendaten überblendet.
+  2. **Nahtlose Zurück-Navigation (Mobile Swipe & Browser Back)**: Öffnet ein Nutzer ein Film-Detail, eine Personen-Filmografie oder eine Kollektion, wird ein echter History-Eintrag angelegt. Die iOS-Safari-Wischgeste vom linken Bildschirmrand sowie die Android-Zurück-Taste schließen exakt die aktuelle Detail-Ebene und kehren an die exakte Scroll-Position der vorherigen Ansicht zurück.
+  3. **Offline-Start im Flugmodus**: Startet der Nutzer die App ohne Internetverbindung, lädt der Service Worker die App-Shell sowie gecachte TMDB-Poster verzögerungsfrei aus dem lokalen Speicher. Ein dezenter Hinweis informiert über den Offline-Modus, während Watchlist, Episoden-Fortschritt und Kalender voll bedienbar bleiben und Änderungen bei Rückkehr ins Netz automatisch synchronisieren.
+- **Visual Identity & Theme**:
+  - *Ästhetische Richtung*: „Atmospheric Minimalism & High-Craft Dark UI“ (Apple-TV- & Linear-inspiriertes OLED-Schwarz `#000000` mit abgestuften Glas-Oberflächen `#141416` und subtilen `1px solid rgba(255,255,255,0.08)` Specular-Rändern).
+  - *Farbpalette & Tokens*: Tiefschwarzer Hintergrund (`--background: #000000`), erhöhte Karten-Oberflächen (`rgba(28,28,30,0.75)`), gestochen scharfe weiße Primärtypografie (`#FFFFFF`), gedämpfte Sekundärtexte (`#A1A1AA`) und semantische Statusfarben (Smaragdgrün `#10B981` für „Gesehen“ & Match-Score).
+  - *Typografie & Hierarchie*: Klare Größen- und Gewichtsabstufung ohne redundante Unterüberschriften; tabellarische Ziffern (`tabular-nums`) für Laufzeiten, Episodennummern, Bewertungen und Erscheinungsdaten.
+  - *Komponenten-Geometrie*: Feste Seitenverhältnisse (`aspect-[2/3]` für Poster, `aspect-video` / `16:9` für Episoden-Stills und Backdrops) verhindern jegliches Nachrutschen von Text oder Buttons während des Bildaufbaus.
+- **Interactive Feedback & Motion**:
+  - **Episoden-Skeleton-Shimmer**: Sanfter, abgedunkelter OLED-Shimmer (`cinema-shimmer`) in exakt derselben Kartenhöhe (`min-h-[112px]`) wie geladene Episodenzeilen.
+  - **Haptisches Feedback & Optimistische UI**: Jedes Abhaken einer Episode oder Umschalten der Watchlist reagiert in `< 16ms` visuell und haptisch, während der Cloud-Vault-Sync im Hintergrund gedrosselt und konfliktfrei abläuft.
 
 ---
 
-## 5. Mehrstufige Automatisierte Test- & Performance-Benchmark-Pipeline
+## 3. Key Product Decisions & Trade-Offs
 
-Wir erstellen eine dedizierte, automatisierte Test- und Benchmark-Suite (`tests/productionReadiness.test.ts`), die sämtliche Schichten der Anwendung prüft, und führen sie in **mehreren aufeinanderfolgenden Optimierungs-Zyklen** aus:
+- **Entscheidung 1: Staffel-Episoden-Rendering mit reservierter Geometrie statt dynamischem Mount/Unmount**
+  - *Gewählter Ansatz*: Während `seasonDetails` für eine neu gewählte Staffel lädt, wird eine exakt baugleiche Skeleton-Liste mit fester Zeilenhöhe und `16:9`-Thumbnail-Box gerendert; zudem werden bereits besuchte Staffeln derselben Serie im Client-Speicher gecacht, sodass ein Zurückwechseln auf eine zuvor geöffnete Staffel in `0ms` ohne erneuten Ladezustand erfolgt.
+  - *Warum*: Verhindert das Zusammenschnurren der Scroll-Fläche beim Staffelwechsel (häufigste Ursache für ungewollte Scroll-Sprünge in mobilen WebViews).
+  - *Verworfene Alternative*: Einfacher Lade-Spinner, da dieser die Dokumenthöhe kollabieren lässt und den Scroll-Anker des Nutzers zerstört.
+- **Entscheidung 2: Stale-While-Revalidate Service Worker + Native Capacitor-Konfiguration**
+  - *Gewählter Ansatz*: Kombination aus einem produktionsreifen Web-Service-Worker (für PWA, Mobile Safari & Smart TV) und einer vollständigen Capacitor-App-Konfiguration (`appId`, `appName`, `server.androidScheme: 'https'`, iOS `contentInset`, Status-Bar-Dark-Mode und CORS-Freigabe für `capacitor://localhost` / `https://localhost`).
+  - *Warum*: Damit kann exakt dasselbe gebaute Bundle einerseits sofort als Web-App/PWA genutzt und andererseits ohne Code-Anpassung mit `npx cap sync ios` / `npx cap sync android` für Xcode und Android Studio exportiert werden.
+- **Entscheidung 3: Verschlüsseltes Firestore-Backup für den Admin-TMDB-Key-Pool + Episoden-Tombstones**
+  - *Gewählter Ansatz*: Der Server spiegelt den AES-256-GCM-verschlüsselten TMDB-Key-Pool in ein server-exklusives Firestore-Dokument (`/serverConfigVault/tmdbKeyPool`, in `firestore.rules` für alle Clients mit `allow read, write: if false;` gesperrt, aber über den Server-Prozess les-/schreibbar via signiertem Server-Token bzw. geschütztem Vault-Eintrag) und erweitert den `userLibraryVault`-Merge um `removedEpisodes: Record<string, number>`.
+  - *Warum*: Garantiert, dass bei Cloud-Run-Neustarts keine im Dashboard gepflegten TMDB-Keys verloren gehen und das Abwählen einzelner Episoden auf allen Geräten konsistent bleibt.
 
-1. **Unit- & Datenintegritäts-Tests**:
-   - Null-sichere Typ-Konvertierung (`resolveMediaType`, `toMediaKey`), Schema-Coercion in `useLocalStorage` bei korrupten JSON-Daten, deterministische Cache-Key-Normalisierung (`buildDeterministicCacheKey`, `normalizeQueryParamValue`).
-2. **Multi-Device-Sync & Konflikt-Tests**:
-   - Simulation von 3 parallelen Geräten (TV, iPhone, Desktop) auf demselben Account: Hinzufügen, Episoden-Fortschritt, gezieltes Löschen (Tombstone-Propagation) und Offline-Wiederverbindung.
-3. **Security- & Penetrations-Tests**:
-   - Prüfung auf unautorisierte Zugriffe (`401`/`403`), Admin-Endpunkt-Sperre für Nicht-Owner, Path-Traversal-Abwehr auf `/api/tmdb/*`, Rate-Limiter-Greifen bei Flood-Requests und 2FA-TOTP-Verifikation.
-4. **Performance- & Last-Benchmarks**:
-   - Durchsatz- und Latenzmessung für L1-Cache-Lookups (`< 1 ms`), Singleflight-Coalescing bei 500 gleichzeitigen Requests und Speichereffizienz der Payload-Kompaktierung (`compactTmdbPayloadForCache`).
-5. **Iterativer Wiederholungs-Zyklus**:
-   - **Zyklus 1**: Ausführung aller Tests & Benchmarks → Auswertung der Latenzen und Edge-Cases.
-   - **Zyklus 2**: Feinoptimierung und erneuter Komplett-Durchlauf inkl. Firestore-Rules-Test.
-   - **Zyklus 3**: Finaler Produktions-Build (`compile_applet` + `lint_applet`) und End-to-End-Abnahme auf dem laufenden Server.
+---
+
+## 4. Technical Architecture & Data Strategy *(Technical Reference)*
+
+- **Architecture & Component Diagram**:
+
+```
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│                    CLIENT SHELL (PWA / iOS Capacitor / VIDAA TV)                  │
+│                                                                                   │
+│  ┌──────────────────────┐   ┌────────────────────────┐   ┌─────────────────────┐  │
+│  │  Service Worker      │   │  NavigationContext     │   │  LibraryContext     │  │
+│  │  (App-Shell + Poster │   │  (pushState Back-Stack │   │  (Watchlist, Movies,│  │
+│  │   SWR Offline Cache) │   │   & Scroll Restore)    │   │   Episode Tombstone)│  │
+│  └──────────┬───────────┘   └───────────┬────────────┘   └──────────┬──────────┘  │
+│             │                           │                           │             │
+│             ▼                           ▼                           ▼             │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │                        DetailView & Season Episode List                     │  │
+│  │  • In-Memory Season Cache (0ms switch back to visited seasons)              │  │
+│  │  • Zero-CLS 16:9 Episode Skeletons (fixed row geometry during fetch)        │  │
+│  └──────────────────────────────────────┬──────────────────────────────────────┘  │
+└─────────────────────────────────────────┼─────────────────────────────────────────┘
+                                          │ HTTPS / REST + Firestore Realtime
+                                          ▼
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│                  GOOGLE CLOUD RUN (Stateless Express + Vite Server)               │
+│                                                                                   │
+│  ┌──────────────────────────────┐               ┌──────────────────────────────┐  │
+│  │  Multi-Key TMDB Pool         │               │  User Sync & Security API    │  │
+│  │  • Circuit Breaker & Rotate  │               │  • /api/user-sync/state      │  │
+│  │  • L1 RAM + Disk + Firestore │               │  • /api/user-sync/delete     │  │
+│  │    Encrypted Key Vault Sync  │               │  • Episode Tombstone Merge   │  │
+│  └──────────────┬───────────────┘               └───────────────┬──────────────┘  │
+└─────────────────┼───────────────────────────────────────────────┼─────────────────┘
+                  │                                               │
+                  ▼                                               ▼
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│                         GOOGLE CLOUD FIRESTORE DATABASE                           │
+│  • /userLibraryVault/{uid}    (1-Doc Atomic Sync + Watchlist/Episode Tombstones)  │
+│  • /userSecurityVault/{uid}   (2FA TOTP & Backup Code Hashes)                     │
+│  • /tmdbSharedCache/{hash}    (L2 Shared Regional TMDB Response Cache)            │
+└───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Data Model & State**:
+  - **Erweitertes `SyncUserLibraryState`-Modell**:
+    - `watchlist: MediaItem[]` (kompaktifizierte Metadaten + `_addedAtMs`)
+    - `watchedMovies: number[]`
+    - `manuallyWatchedShows: number[]`
+    - `watchedEpisodes: Record<number, number[]>`
+    - `removedWatchlistKeys: Record<string, number>`
+    - `removedMovies: Record<string, number>`
+    - `removedShows: Record<string, number>`
+    - `removedEpisodes: Record<string, number>` *(Neu: Schlüssel `"${seriesId}:${episodeId}"` → Lösch-Zeitstempel in ms, verhindert Wiederauftauchen abgewählter Episoden beim Multi-Geräte-Merge)*
+  - **Staffel-Episoden-Cache & Ladezustand (`DetailView`)**:
+    - `seasonCacheRef: Map<number, SeasonDetails>` hält bereits geladene Staffeln der geöffneten Serie im Speicher.
+    - `loadingSeasonNumber: number | null` steuert das Layout-Shift-freie Episoden-Skeleton während des Staffelwechsels, ohne die bestehende Header- oder Tab-Geometrie zu verändern.
+
+- **Interactive Component & State Mapping**:
+  - **Staffel-Auswahl (`handleSeasonChange`)**:
+    1. Prüft zuerst `seasonCacheRef.current.get(seasonNumber)` → bei Treffer sofortiges Setzen von `seasonDetails` ohne Netzwerk-Request und ohne Skeleton (`0ms`).
+    2. Bei Cache-Miss wird `loadingSeasonNumber = seasonNumber` gesetzt; der Episoden-Container rendert 6 maßstabsgetreue Episoden-Skeleton-Karten (`min-h-[116px]`, festes `16:9` Vorschaubild-Rechteck links, Titel-/Metadaten-Balken mittig, runder Check-Button-Platzhalter rechts).
+    3. Nach Abschluss von `tmdb.getTvSeasonDetails` werden die Daten im `seasonCacheRef` abgelegt und sanft eingeblendet.
+  - **Episoden-Abhaken (`toggleEpisodeWatched`)**:
+    1. Beim Abhaken einer Episode wird diese zu `watchedEpisodes[seriesId]` hinzugefügt und ein eventueller Eintrag in `removedEpisodes["${seriesId}:${episodeId}"]` gelöscht.
+    2. Beim Abwählen einer Episode wird `removedEpisodes["${seriesId}:${episodeId}"] = Date.now()` gesetzt und beim Cloud-Merge (`mergeUserSyncLibraryState` auf Client & Server) berücksichtigt.
+  - **History-Navigation (`NavigationContext`)**:
+    1. Öffnen eines Details (`handleExpand` / `navigateToDetail`) nutzt `window.history.pushState`, wenn von einem Tab in ein Detail gewechselt wird, sodass die native iOS-Swipe-Back-Geste und der Browser-Zurück-Button das Detail schließen, ohne die App zu verlassen.
+  - **Dual-Release-Packaging (PWA + Capacitor)**:
+    1. Registrierung eines produktionsreifen `/sw.js` Service Workers (App-Shell + TMDB-Poster-Cache mit Quota-Schutz) für sofortigen Offline-Start.
+    2. Bereitstellung einer direkt einsatzbereiten `capacitor.config.json` für den Export nach iOS (Xcode / App Store Connect) und Android (Android Studio / Google Play Console).

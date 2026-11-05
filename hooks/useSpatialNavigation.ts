@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { recordNavigationStart, recordNavigationComplete } from '../services/performanceMonitor';
 
 export type TvDirection = 'up' | 'down' | 'left' | 'right';
 export type TvColorKey = 'red' | 'green' | 'yellow' | 'blue';
@@ -23,6 +24,39 @@ const FOCUSABLE_SELECTOR = [
 
 // Remembers the last focused item inside each horizontal [data-tv-row="true"] rail
 const rowMemoryMap = new WeakMap<HTMLElement, HTMLElement>();
+
+// Phase 7: Spatial Geometry & Candidate Cache (eliminates full-DOM getBoundingClientRect reflows on every keystroke)
+interface SpatialGeometryCache {
+  scopeRoot: ParentNode | null;
+  candidates: HTMLElement[];
+  rows: HTMLElement[];
+  rects: WeakMap<HTMLElement, DOMRect>;
+  timestamp: number;
+}
+
+const spatialCache: SpatialGeometryCache = {
+  scopeRoot: null,
+  candidates: [],
+  rows: [],
+  rects: new WeakMap<HTMLElement, DOMRect>(),
+  timestamp: 0,
+};
+
+export function invalidateSpatialNavigationCache(): void {
+  spatialCache.scopeRoot = null;
+  spatialCache.candidates = [];
+  spatialCache.rows = [];
+  spatialCache.rects = new WeakMap<HTMLElement, DOMRect>();
+  spatialCache.timestamp = 0;
+}
+
+function getCachedRect(el: HTMLElement): DOMRect {
+  const cached = spatialCache.rects.get(el);
+  if (cached) return cached;
+  const rect = el.getBoundingClientRect();
+  spatialCache.rects.set(el, rect);
+  return rect;
+}
 
 function safeClosest(el: Element | null | undefined, selector: string): HTMLElement | null {
   if (!el || typeof el.closest !== 'function') return null;
@@ -88,7 +122,7 @@ function isElementVisible(el: HTMLElement): boolean {
     ) {
       return false;
     }
-    const rect = el.getBoundingClientRect();
+    const rect = getCachedRect(el);
     return rect.width > 4 && rect.height > 4;
   } catch {
     return false;
@@ -119,8 +153,24 @@ function getActiveScopeRoot(): ParentNode {
 function getFocusableCandidates(scopeRoot?: ParentNode): HTMLElement[] {
   try {
     const root = scopeRoot || getActiveScopeRoot();
+    const now = performance.now();
+    if (
+      root === spatialCache.scopeRoot &&
+      spatialCache.candidates.length > 0 &&
+      now - spatialCache.timestamp < 320 &&
+      spatialCache.candidates.every((el) => el.isConnected)
+    ) {
+      return spatialCache.candidates;
+    }
+
     const raw = Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
-    return raw.filter(isElementVisible);
+    const visible = raw.filter(isElementVisible);
+    if (!scopeRoot || scopeRoot === spatialCache.scopeRoot || !spatialCache.scopeRoot) {
+      spatialCache.scopeRoot = root;
+      spatialCache.candidates = visible;
+      spatialCache.timestamp = now;
+    }
+    return visible;
   } catch {
     return [];
   }
@@ -129,9 +179,15 @@ function getFocusableCandidates(scopeRoot?: ParentNode): HTMLElement[] {
 /**
  * Smoothly centers a focused card horizontally inside its rail AND centers the active row
  * vertically inside its scroll container (<main> or overlay), matching Netflix / Apple TV+.
+ * Phase 7: Uses instant scroll ('auto') during rapid key-repeat to avoid competing smooth animations.
  */
-function centerElementAndRowInViewport(target: HTMLElement, rowEl?: HTMLElement | null) {
+function centerElementAndRowInViewport(
+  target: HTMLElement,
+  rowEl?: HTMLElement | null,
+  rapidRepeat = false
+) {
   try {
+    const scrollBehavior: ScrollBehavior = rapidRepeat ? 'auto' : 'smooth';
     const activeRow = rowEl || safeClosest(target, '[data-tv-row="true"]');
 
     // 1. Center card horizontally inside its scrollable rail
@@ -148,7 +204,7 @@ function centerElementAndRowInViewport(target: HTMLElement, rowEl?: HTMLElement 
 
       safeScrollTo(activeRow, {
         left: Math.max(0, targetCenterOffset),
-        behavior: 'smooth',
+        behavior: scrollBehavior,
       });
     }
 
@@ -172,12 +228,12 @@ function centerElementAndRowInViewport(target: HTMLElement, rowEl?: HTMLElement 
 
       safeScrollTo(scrollContainer, {
         top: Math.max(0, desiredScrollTop),
-        behavior: 'smooth',
+        behavior: scrollBehavior,
       });
     } else if (typeof target.scrollIntoView === 'function') {
       try {
         target.scrollIntoView({
-          behavior: 'smooth',
+          behavior: scrollBehavior,
           block: 'center',
           inline: 'center',
         });
@@ -185,6 +241,8 @@ function centerElementAndRowInViewport(target: HTMLElement, rowEl?: HTMLElement 
         target.scrollIntoView(false);
       }
     }
+    // Invalidate geometry cache after scroll positions change
+    spatialCache.rects = new WeakMap<HTMLElement, DOMRect>();
   } catch {
     // ignore scroll errors on legacy TV engines
   }
@@ -195,19 +253,30 @@ function centerElementAndRowInViewport(target: HTMLElement, rowEl?: HTMLElement 
  */
 function getVisibleTvRows(scopeRoot: ParentNode): HTMLElement[] {
   try {
+    if (
+      scopeRoot === spatialCache.scopeRoot &&
+      spatialCache.rows.length > 0 &&
+      spatialCache.rows.every((r) => r.isConnected)
+    ) {
+      return spatialCache.rows;
+    }
+
     const rows = Array.from(scopeRoot.querySelectorAll<HTMLElement>('[data-tv-row="true"]')).filter(
       (row) => {
         if (!row.isConnected) return false;
         const style = window.getComputedStyle(row);
         if (style.display === 'none' || style.visibility === 'hidden') return false;
-        const rect = row.getBoundingClientRect();
+        const rect = getCachedRect(row);
         if (rect.width <= 4 || rect.height <= 4) return false;
         const items = getFocusableCandidates(row);
         return items.length > 0;
       }
     );
 
-    rows.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+    rows.sort((a, b) => getCachedRect(a).top - getCachedRect(b).top);
+    if (scopeRoot === spatialCache.scopeRoot) {
+      spatialCache.rows = rows;
+    }
     return rows;
   } catch {
     return [];
@@ -228,12 +297,12 @@ function pickTargetInRow(row: HTMLElement, referenceX: number): HTMLElement | nu
     return remembered;
   }
 
-  items.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+  items.sort((a, b) => getCachedRect(a).left - getCachedRect(b).left);
 
   let best = items[0];
   let bestDist = Number.POSITIVE_INFINITY;
   for (const item of items) {
-    const r = item.getBoundingClientRect();
+    const r = getCachedRect(item);
     const cx = r.left + r.width / 2;
     const dist = Math.abs(cx - referenceX);
     if (dist < bestDist) {
@@ -250,7 +319,7 @@ function findNextSpatialTarget(
   candidates: HTMLElement[],
   scopeRoot: ParentNode
 ): HTMLElement | null {
-  const currRect = current.getBoundingClientRect();
+  const currRect = getCachedRect(current);
   const currCenterX = currRect.left + currRect.width / 2;
   const currCenterY = currRect.top + currRect.height / 2;
   const isHorizontal = direction === 'left' || direction === 'right';
@@ -261,7 +330,7 @@ function findNextSpatialTarget(
   // 1. STRICT HORIZONTAL ROW NAVIGATION (Left / Right inside a [data-tv-row="true"] rail)
   if (isHorizontal && currentRow && !isMultiRowGrid) {
     const rowItems = getFocusableCandidates(currentRow);
-    rowItems.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+    rowItems.sort((a, b) => getCachedRect(a).left - getCachedRect(b).left);
     const idx = rowItems.indexOf(current);
     if (idx !== -1) {
       const nextIdx = direction === 'right' ? idx + 1 : idx - 1;
@@ -303,7 +372,7 @@ function findNextSpatialTarget(
       continue;
     }
 
-    const rect = cand.getBoundingClientRect();
+    const rect = getCachedRect(cand);
     const candCenterX = rect.left + rect.width / 2;
     const candCenterY = rect.top + rect.height / 2;
 
@@ -345,8 +414,9 @@ function findNextSpatialTarget(
 }
 
 /**
- * Spatial 4-Way D-Pad & Hisense VIDAA Remote Navigation Engine
- * Works like Netflix / Apple TV+: strict row-by-row jumping, per-row memory, and smooth auto-centering.
+ * Spatial 4-Way D-Pad & Hisense VIDAA Remote Navigation Engine (Phase 7 Optimized)
+ * - Caches focusable elements & DOMRects per layout state (invalidated on DOM mutation, scroll, resize, hashchange).
+ * - Throttles rapid key-repeat (85ms) and switches to instant scroll during rapid D-Pad hold.
  */
 export function useSpatialNavigation({
   enabled = true,
@@ -369,6 +439,22 @@ export function useSpatialNavigation({
 
   useEffect(() => {
     if (!enabled || typeof window === 'undefined') return;
+
+    let lastDirectionMoveAt = 0;
+
+    // Invalidate spatial cache when DOM changes, route changes, or viewport resizes
+    const onInvalidate = () => invalidateSpatialNavigationCache();
+    window.addEventListener('resize', onInvalidate, { passive: true });
+    window.addEventListener('hashchange', onInvalidate, { passive: true });
+    window.addEventListener('popstate', onInvalidate, { passive: true });
+
+    let observer: MutationObserver | null = null;
+    if (typeof MutationObserver !== 'undefined' && document.body) {
+      observer = new MutationObserver(() => {
+        invalidateSpatialNavigationCache();
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
 
     const handleKeyDown = (e: KeyboardEvent) => {
       try {
@@ -479,11 +565,26 @@ export function useSpatialNavigation({
           if (direction === 'right' && selStart < valLen) return;
         }
 
+        e.preventDefault();
+
+        // Phase 7: Throttle rapid key-repeat (85ms) so holding D-Pad doesn't double-fire or freeze WebViews
+        const now = performance.now();
+        const elapsedSinceLastMove = now - lastDirectionMoveAt;
+        if (elapsedSinceLastMove < 85) {
+          return;
+        }
+        const isRapidRepeat = elapsedSinceLastMove < 200 || e.repeat;
+        lastDirectionMoveAt = now;
+
+        recordNavigationStart();
+
         const scopeRoot = getActiveScopeRoot();
         const candidates = getFocusableCandidates(scopeRoot);
-        if (candidates.length === 0) return;
+        if (candidates.length === 0) {
+          recordNavigationComplete();
+          return;
+        }
 
-        e.preventDefault();
         document.documentElement.setAttribute('data-tv-nav-active', 'true');
 
         const burgerBtn = document.querySelector<HTMLElement>(
@@ -494,6 +595,7 @@ export function useSpatialNavigation({
         if (burgerBtn && activeEl === burgerBtn && isTvModeRef.current) {
           if (direction === 'up') {
             window.dispatchEvent(new CustomEvent('mj:open-tv-menu'));
+            recordNavigationComplete();
             return;
           }
           if (direction === 'down') {
@@ -503,7 +605,8 @@ export function useSpatialNavigation({
               if (firstRowTarget) {
                 rowMemoryMap.set(rows[0], firstRowTarget);
                 safeFocus(firstRowTarget);
-                centerElementAndRowInViewport(firstRowTarget, rows[0]);
+                centerElementAndRowInViewport(firstRowTarget, rows[0], isRapidRepeat);
+                recordNavigationComplete();
                 return;
               }
             }
@@ -517,14 +620,16 @@ export function useSpatialNavigation({
             const initial = pickTargetInRow(rows[0], 200) || candidates[0];
             rowMemoryMap.set(rows[0], initial);
             safeFocus(initial);
-            centerElementAndRowInViewport(initial, rows[0]);
+            centerElementAndRowInViewport(initial, rows[0], isRapidRepeat);
+            recordNavigationComplete();
             return;
           }
           const first =
             candidates.find((c) => c.getAttribute?.('data-tv-burger-trigger') !== 'true') ||
             candidates[0];
           safeFocus(first);
-          centerElementAndRowInViewport(first);
+          centerElementAndRowInViewport(first, null, isRapidRepeat);
+          recordNavigationComplete();
           return;
         }
 
@@ -536,15 +641,16 @@ export function useSpatialNavigation({
           }
 
           safeFocus(nextTarget);
-          centerElementAndRowInViewport(nextTarget, targetRow);
+          centerElementAndRowInViewport(nextTarget, targetRow, isRapidRepeat);
 
           if (direction === 'up' && targetRow) {
             const allRows = getVisibleTvRows(scopeRoot);
             if (allRows.length > 0 && allRows[0] === targetRow) {
               const mainEl = document.querySelector<HTMLElement>('main');
-              safeScrollTo(mainEl, { top: 0, behavior: 'smooth' });
+              safeScrollTo(mainEl, { top: 0, behavior: isRapidRepeat ? 'auto' : 'smooth' });
             }
           }
+          recordNavigationComplete();
           return;
         }
 
@@ -556,19 +662,26 @@ export function useSpatialNavigation({
           scopeRoot === document
         ) {
           const mainEl = document.querySelector<HTMLElement>('main');
-          safeScrollTo(mainEl, { top: 0, behavior: 'smooth' });
+          safeScrollTo(mainEl, { top: 0, behavior: isRapidRepeat ? 'auto' : 'smooth' });
           if (activeEl !== burgerBtn) {
             safeFocus(burgerBtn);
           } else {
             window.dispatchEvent(new CustomEvent('mj:open-tv-menu'));
           }
         }
+        recordNavigationComplete();
       } catch (err) {
         console.warn('Spatial navigation error:', err);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown, { capture: false });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: false });
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown, { capture: false });
+      window.removeEventListener('resize', onInvalidate);
+      window.removeEventListener('hashchange', onInvalidate);
+      window.removeEventListener('popstate', onInvalidate);
+      observer?.disconnect();
+    };
   }, [enabled]);
 }

@@ -1100,6 +1100,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
                         <MovieCard
                           item={simItem}
                           tmdb={tmdb}
+                          imageUrl={tmdb.getImageUrl(simItem.poster_path || simItem.backdrop_path, 'w500')}
                           onClick={handleGridItemClick}
                         />
                       </div>
@@ -1121,11 +1122,6 @@ export const SearchView: React.FC<SearchViewProps> = ({
                           <h2 className="text-lg sm:text-xl font-bold text-white tracking-tight">
                             {isDe ? 'Top-Auswahl für dich' : 'Top Picks for You'}
                           </h2>
-                          <p className="text-xs text-zinc-400">
-                            {isDe
-                              ? `Basierend auf deinem Geschmacksprofil · ${regionCode}`
-                              : `Curated from your taste profile · ${regionCode}`}
-                          </p>
                         </div>
                       </div>
 
@@ -1144,6 +1140,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
                               <MovieCard
                                 item={recItem}
                                 tmdb={tmdb}
+                                imageUrl={tmdb.getImageUrl(recItem.poster_path || recItem.backdrop_path, 'w500')}
                                 onClick={handleGridItemClick}
                               />
                               <div className="flex items-center gap-1.5 text-[11px] text-zinc-400 px-0.5 tabular-nums">
@@ -1175,11 +1172,6 @@ export const SearchView: React.FC<SearchViewProps> = ({
                             ? `Weil dir „${row.seedTitle}“ gefällt`
                             : `Because You Liked "${row.seedTitle}"`}
                         </h2>
-                        <p className="text-xs text-zinc-400">
-                          {isDe
-                            ? 'Thematisch & stilistisch verwandte Empfehlungen'
-                            : 'Thematically and stylistically related titles'}
-                        </p>
                       </div>
 
                       <div className="flex items-start gap-3.5 overflow-x-auto no-scrollbar ios-snap-row pb-2">
@@ -1198,6 +1190,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
                               <MovieCard
                                 item={seedRec}
                                 tmdb={tmdb}
+                                imageUrl={tmdb.getImageUrl(seedRec.poster_path || seedRec.backdrop_path, 'w500')}
                                 onClick={handleGridItemClick}
                               />
                               <div className="flex items-center gap-1.5 text-[11px] text-zinc-400 px-0.5 tabular-nums">
@@ -1229,11 +1222,6 @@ export const SearchView: React.FC<SearchViewProps> = ({
                             ? 'Kritiker-Meisterwerke für deinen Geschmack'
                             : 'Critically Acclaimed for Your Taste'}
                         </h2>
-                        <p className="text-xs text-zinc-400">
-                          {isDe
-                            ? 'Höchstbewertete Filme & Serien in deiner Region'
-                            : 'Top-rated films & series available in your region'}
-                        </p>
                       </div>
 
                       <div className="flex items-start gap-3.5 overflow-x-auto no-scrollbar ios-snap-row pb-2">
@@ -1245,6 +1233,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
                             <MovieCard
                               item={gem}
                               tmdb={tmdb}
+                              imageUrl={tmdb.getImageUrl(gem.poster_path || gem.backdrop_path, 'w500')}
                               onClick={handleGridItemClick}
                             />
                           </div>

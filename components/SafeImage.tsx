@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Film, Tv, User } from './Icons';
 import { MediaType } from '../types';
 
@@ -8,16 +8,17 @@ interface SafeImageProps extends React.ImgHTMLAttributes<HTMLImageElement> {
   fallbackLabel?: string;
   mediaType?: MediaType | string;
   containerClassName?: string;
+  fetchPriority?: 'high' | 'low' | 'auto';
 }
 
 /**
-  * SafeImage (Zero-Broken-Image Policy + iOS WKWebView WebP Resilience)
-  * --------------------------------------------------------------------
-  * Renders high-resolution TMDB photography without blocking visibility on `onLoad`
-  * (preventing iOS WKWebView ImageIO WebP warnings from leaving cards at opacity-0),
-  * automatically retries once at `w300` resolution if a large image fails to decode,
-  * and displays a clean editorial fallback surface if an image path is missing.
-  */
+ * SafeImage (Phase 3: Strict Lazy Loading, Request Cancellation on Navigation & Zero-Broken-Image Policy)
+ * ------------------------------------------------------------------------------------------------------
+ * - Defaults to `loading="lazy"` unless `fetchPriority="high"` or `loading="eager"` is explicitly set.
+ * - Cancels in-flight image downloads on component unmount / tab navigation so offscreen requests
+ *   never compete with active view assets.
+ * - Automatically retries once at `w300` resolution if a larger TMDB image fails to decode.
+ */
 export const SafeImage: React.FC<SafeImageProps> = ({
   src,
   alt = '',
@@ -27,11 +28,13 @@ export const SafeImage: React.FC<SafeImageProps> = ({
   className = '',
   containerClassName = '',
   loading,
+  fetchPriority,
   ...rest
 }) => {
   const [currentSrc, setCurrentSrc] = useState<string | null | undefined>(src);
   const [retried, setRetried] = useState(false);
   const [failed, setFailed] = useState(false);
+  const imgRef = useRef<HTMLImageElement | null>(null);
 
   const label = fallbackTitle || fallbackLabel || alt || '';
 
@@ -40,6 +43,20 @@ export const SafeImage: React.FC<SafeImageProps> = ({
     setRetried(false);
     setFailed(false);
   }, [src]);
+
+  // Phase 3: Cancel pending image download if user navigates away before decode completes
+  useEffect(() => {
+    return () => {
+      const el = imgRef.current;
+      if (el && !el.complete) {
+        try {
+          el.src = '';
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, []);
 
   const handleError = () => {
     if (!retried && currentSrc && currentSrc.includes('image.tmdb.org/t/p/')) {
@@ -71,12 +88,16 @@ export const SafeImage: React.FC<SafeImageProps> = ({
     );
   }
 
+  const effectiveLoading = loading || (fetchPriority === 'high' ? 'eager' : 'lazy');
+
   return (
     <img
+      ref={imgRef}
       src={currentSrc}
       alt={label || 'Media artwork'}
       decoding="async"
-      loading={loading || 'eager'}
+      loading={effectiveLoading}
+      {...(fetchPriority ? { fetchPriority } : {})}
       onError={handleError}
       className={`${className} bg-zinc-900`}
       {...rest}

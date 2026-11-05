@@ -128,7 +128,7 @@ export const QuickPeekSheet: React.FC<QuickPeekSheetProps> = ({
 
   const handleShare = async () => {
     const result = await shareMediaItem(item);
-    if (result === 'copied') {
+    if (result) {
       setShareToast(true);
       setTimeout(() => setShareToast(false), 2200);
     }

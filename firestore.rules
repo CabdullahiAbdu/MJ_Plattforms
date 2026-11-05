@@ -215,8 +215,7 @@ service cloud.firestore {
           incoming().uid == userId &&
           incoming().mediaKey == mediaKey &&
           incoming().addedAt == request.time &&
-          incoming().updatedAt == request.time &&
-          parentUserExists(userId);
+          incoming().updatedAt == request.time;
 
         allow update: if isOwner(userId) &&
           isValidId(userId) &&
@@ -236,10 +235,9 @@ service cloud.firestore {
             'voteAverage',
             'overview',
             'updatedAt'
-          ]) &&
-          parentUserExists(userId);
+          ]);
 
-        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(mediaKey) && existing().uid == request.auth.uid && parentUserExists(userId);
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(mediaKey) && existing().uid == request.auth.uid;
       }
 
       // 3. User Watch Progress Subcollection (/users/{userId}/progress/{mediaKey})
@@ -254,8 +252,7 @@ service cloud.firestore {
           incoming().uid == userId &&
           incoming().mediaKey == mediaKey &&
           incoming().createdAt == request.time &&
-          incoming().updatedAt == request.time &&
-          parentUserExists(userId);
+          incoming().updatedAt == request.time;
 
         allow update: if isOwner(userId) &&
           isValidId(userId) &&
@@ -271,10 +268,9 @@ service cloud.firestore {
             'isCompleted',
             'watchedEpisodes',
             'updatedAt'
-          ]) &&
-          parentUserExists(userId);
+          ]);
 
-        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(mediaKey) && existing().uid == request.auth.uid && parentUserExists(userId);
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(mediaKey) && existing().uid == request.auth.uid;
       }
     }
 
@@ -424,7 +420,36 @@ service cloud.firestore {
       allow create, update: if isValidId(userId) &&
         isValidUserSecurityVaultEntry(incoming()) &&
         incoming().uid == userId;
-      allow delete: if isValidId(userId);
+      allow delete: if isOwner(userId) && isValidId(userId);
+    }
+
+    // 8. Atomic 1-Document Multi-Device User Library Vault (/userLibraryVault/{userId})
+    function isValidUserLibraryVaultEntry(data) {
+      return data.keys().hasAll([
+          'uid',
+          'libraryJson',
+          'itemCount',
+          'updatedAtMs'
+        ]) &&
+        data.keys().hasOnly([
+          'uid',
+          'libraryJson',
+          'itemCount',
+          'updatedAtMs'
+        ]) &&
+        data.uid is string && isValidId(data.uid) &&
+        data.libraryJson is string && data.libraryJson.size() >= 2 && data.libraryJson.size() <= 900000 &&
+        data.itemCount is number && data.itemCount >= 0 && data.itemCount <= 5000 &&
+        data.updatedAtMs is number && data.updatedAtMs > 0;
+    }
+
+    match /userLibraryVault/{userId} {
+      allow get: if isValidId(userId);
+      allow list: if false;
+      allow create, update: if isValidId(userId) &&
+        isValidUserLibraryVaultEntry(incoming()) &&
+        incoming().uid == userId;
+      allow delete: if isOwner(userId) && isValidId(userId);
     }
   }
 }

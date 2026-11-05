@@ -8,6 +8,8 @@ import {
   saveWatchProgressFirestore,
   mergeLocalLibraryIntoFirestore,
   subscribeToUserLibraryRealtime,
+  syncFullLibrarySnapshotToCloud,
+  toFirestoreMediaKey,
   resetWriteQuotaCooldown,
 } from '../services/firebase';
 
@@ -16,13 +18,16 @@ const STORAGE_KEY_WATCHED_EPISODES = 'tmdb_watched_episodes_v1';
 const STORAGE_KEY_WATCHED_MOVIES = 'tmdb_watched_movies_v1';
 const STORAGE_KEY_WATCHED_SHOWS_FULL = 'tmdb_watched_shows_full_v1';
 
-interface LibraryContextValue {
+export interface LibraryStateContextValue {
   watchlist: MediaItem[];
   watchedEpisodes: Record<number, number[]>;
   watchedMovies: number[];
   manuallyWatchedShows: number[];
   watchedCompositeKeys: Set<string>;
   isInWatchlist: (id: number, type?: MediaType | string) => boolean;
+}
+
+export interface LibraryActionsContextValue {
   toggleWatchlist: (
     item: MediaItem,
     onNotify?: (msg: string, type: 'success' | 'info') => void
@@ -35,7 +40,10 @@ interface LibraryContextValue {
   resetLibraryData: () => void;
 }
 
-const LibraryContext = createContext<LibraryContextValue | null>(null);
+export type LibraryContextValue = LibraryStateContextValue & LibraryActionsContextValue;
+
+const LibraryStateContext = createContext<LibraryStateContextValue | null>(null);
+const LibraryActionsContext = createContext<LibraryActionsContextValue | null>(null);
 
 export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { currentUser } = useConfig();
@@ -63,10 +71,49 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const manuallyWatchedShowsRef = useRef(manuallyWatchedShows);
   manuallyWatchedShowsRef.current = manuallyWatchedShows;
 
+  // Tombstone maps so deletions propagate cleanly across devices via /userLibraryVault/{uid}
+  const removedWatchlistKeysRef = useRef<Record<string, number>>({});
+  const removedMoviesRef = useRef<Record<string, number>>({});
+  const removedShowsRef = useRef<Record<string, number>>({});
+  const vaultSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const scheduleAtomicVaultSync = useCallback(
+    (
+      uid: string,
+      overrides?: {
+        watchlist?: MediaItem[];
+        watchedMovies?: number[];
+        manuallyWatchedShows?: number[];
+        watchedEpisodes?: Record<number, number[]>;
+      }
+    ) => {
+      if (!uid) return;
+      const nextSnapshot = {
+        watchlist: overrides?.watchlist ?? watchlistRef.current,
+        watchedMovies: overrides?.watchedMovies ?? watchedMoviesRef.current,
+        manuallyWatchedShows: overrides?.manuallyWatchedShows ?? manuallyWatchedShowsRef.current,
+        watchedEpisodes: overrides?.watchedEpisodes ?? watchedEpisodesRef.current,
+        removedWatchlistKeys: { ...removedWatchlistKeysRef.current },
+        removedMovies: { ...removedMoviesRef.current },
+        removedShows: { ...removedShowsRef.current },
+      };
+
+      if (vaultSyncTimerRef.current) {
+        clearTimeout(vaultSyncTimerRef.current);
+        vaultSyncTimerRef.current = null;
+      }
+      syncFullLibrarySnapshotToCloud(uid, nextSnapshot).catch((e) =>
+        console.error('Atomic vault sync error:', e)
+      );
+    },
+    []
+  );
+
   // Production Real-Time Multi-Device Account Sync:
-  // 1. On account login / boot, merges any local device items with the account's cloud state (Firestore + Server Vault)
-  //    so no device ever loses or hides items created on another device.
-  // 2. Subscribes in real time (onSnapshot + Server Sync Vault) so changes on any device appear across all devices.
+  // 1. On account login / boot, merges any local device items with the account's cloud state
+  //    (/userLibraryVault/{uid} + Firestore Subcollections + Server Sync Vault).
+  // 2. Subscribes in real time so changes on any device or URL (ais-dev, ais-pre, iPhone, Hisense TV)
+  //    appear across all devices immediately.
   useEffect(() => {
     if (!currentUser?.uid) {
       return;
@@ -74,7 +121,6 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
     const uid = currentUser.uid;
     let cancelled = false;
-    let initialMergeDone = false;
 
     const performFullMerge = async () => {
       try {
@@ -87,21 +133,45 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
           manuallyWatchedShowsRef.current
         );
         if (cancelled) return;
-        initialMergeDone = true;
+        watchlistRef.current = merged.watchlist;
+        watchedMoviesRef.current = merged.watchedMovies;
+        manuallyWatchedShowsRef.current = merged.manuallyWatchedShows;
+        watchedEpisodesRef.current = merged.watchedEpisodes;
         setWatchlist(merged.watchlist);
         setWatchedMovies(merged.watchedMovies);
         setManuallyWatchedShows(merged.manuallyWatchedShows);
         setWatchedEpisodes(merged.watchedEpisodes);
       } catch (e) {
         console.error('Account library merge error:', e);
-        initialMergeDone = true;
       }
     };
 
     performFullMerge();
 
-    const unsubscribeRealtime = subscribeToUserLibraryRealtime(uid, (remoteSnap) => {
-      if (cancelled || !initialMergeDone) return;
+    const unsubscribeRealtime = subscribeToUserLibraryRealtime(uid, (remoteSnap: any) => {
+      if (cancelled) return;
+      if (remoteSnap.removedWatchlistKeys) {
+        removedWatchlistKeysRef.current = {
+          ...removedWatchlistKeysRef.current,
+          ...remoteSnap.removedWatchlistKeys,
+        };
+      }
+      if (remoteSnap.removedMovies) {
+        removedMoviesRef.current = {
+          ...removedMoviesRef.current,
+          ...remoteSnap.removedMovies,
+        };
+      }
+      if (remoteSnap.removedShows) {
+        removedShowsRef.current = {
+          ...removedShowsRef.current,
+          ...remoteSnap.removedShows,
+        };
+      }
+      watchlistRef.current = remoteSnap.watchlist;
+      watchedMoviesRef.current = remoteSnap.watchedMovies;
+      manuallyWatchedShowsRef.current = remoteSnap.manuallyWatchedShows;
+      watchedEpisodesRef.current = remoteSnap.watchedEpisodes;
       setWatchlist(remoteSnap.watchlist);
       setWatchedMovies(remoteSnap.watchedMovies);
       setManuallyWatchedShows(remoteSnap.manuallyWatchedShows);
@@ -115,55 +185,80 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
     return () => {
       cancelled = true;
+      if (vaultSyncTimerRef.current) {
+        clearTimeout(vaultSyncTimerRef.current);
+        vaultSyncTimerRef.current = null;
+      }
       unsubscribeRealtime();
       window.removeEventListener('mj:force-library-sync', onForceSync);
     };
   }, [currentUser?.uid, setWatchlist, setWatchedMovies, setManuallyWatchedShows, setWatchedEpisodes]);
 
+  // O(1) Watchlist Lookup Set for fast card rendering without O(N) array scans on every card
+  const watchlistKeySet = useMemo(() => {
+    const set = new Set<string>();
+    for (const w of watchlist) {
+      if (w && w.id) {
+        const itemType: MediaType = resolveMediaType(w) === 'tv' ? 'tv' : 'movie';
+        set.add(toMediaKey(w.id, itemType));
+      }
+    }
+    return set;
+  }, [watchlist]);
+
   const isInWatchlist = useCallback(
     (id: number, type?: MediaType | string): boolean => {
       const targetType: MediaType = type === 'tv' ? 'tv' : 'movie';
-      return watchlist.some((w) => {
-        if (w.id !== id) return false;
-        const itemType = resolveMediaType(w);
-        return itemType === targetType;
-      });
+      return watchlistKeySet.has(toMediaKey(id, targetType));
     },
-    [watchlist]
+    [watchlistKeySet]
   );
 
   const toggleWatchlist = useCallback(
     (item: MediaItem, onNotify?: (msg: string, type: 'success' | 'info') => void) => {
       const normalizedType: 'movie' | 'tv' = resolveMediaType(item) === 'tv' ? 'tv' : 'movie';
-      const normalizedItem: MediaItem = { ...item, media_type: normalizedType };
+      const nowMs = Date.now();
+      const normalizedItem: MediaItem = {
+        ...item,
+        media_type: normalizedType,
+        ...({ _addedAtMs: nowMs } as any),
+      };
+      const mediaKey = toFirestoreMediaKey(normalizedItem.id, normalizedType);
 
-      const exists = watchlist.some(
+      const currentWl = watchlistRef.current;
+      const exists = currentWl.some(
         (w) => w.id === normalizedItem.id && resolveMediaType(w) === normalizedType
       );
 
       if (exists) {
         onNotify?.('Aus Watchlist entfernt', 'info');
-        setWatchlist((prev) =>
-          prev.filter(
-            (w) => !(w.id === normalizedItem.id && resolveMediaType(w) === normalizedType)
-          )
+        removedWatchlistKeysRef.current[mediaKey] = nowMs;
+        const nextWl = currentWl.filter(
+          (w) => !(w.id === normalizedItem.id && resolveMediaType(w) === normalizedType)
         );
+        watchlistRef.current = nextWl;
+        setWatchlist(nextWl);
         if (currentUser?.uid) {
+          scheduleAtomicVaultSync(currentUser.uid, { watchlist: nextWl });
           deleteWatchlistItemFirestore(currentUser.uid, normalizedItem.id, normalizedType).catch(
             (e) => console.error('Cloud watchlist delete failed:', e)
           );
         }
       } else {
         onNotify?.('Zur Watchlist hinzugefügt', 'success');
-        setWatchlist((prev) => [normalizedItem, ...prev]);
+        delete removedWatchlistKeysRef.current[mediaKey];
+        const nextWl = [normalizedItem, ...currentWl];
+        watchlistRef.current = nextWl;
+        setWatchlist(nextWl);
         if (currentUser?.uid) {
+          scheduleAtomicVaultSync(currentUser.uid, { watchlist: nextWl });
           saveWatchlistItemFirestore(currentUser.uid, normalizedItem).catch((e) =>
             console.error('Cloud watchlist save failed:', e)
           );
         }
       }
     },
-    [watchlist, setWatchlist, currentUser]
+    [setWatchlist, currentUser?.uid, scheduleAtomicVaultSync]
   );
 
   const toggleEpisodeWatched = useCallback(
@@ -174,9 +269,12 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
         const newList = exists
           ? currentList.filter((id) => id !== episodeId)
           : [...currentList, episodeId];
+        const nextMap = { ...prev, [seriesId]: newList };
+        watchedEpisodesRef.current = nextMap;
 
         if (currentUser?.uid) {
-          const isFull = manuallyWatchedShows.includes(seriesId);
+          const isFull = manuallyWatchedShowsRef.current.includes(seriesId);
+          scheduleAtomicVaultSync(currentUser.uid, { watchedEpisodes: nextMap });
           saveWatchProgressFirestore(
             currentUser.uid,
             seriesId,
@@ -186,10 +284,10 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
           ).catch((e) => console.error('Cloud episode progress save failed:', e));
         }
 
-        return { ...prev, [seriesId]: newList };
+        return nextMap;
       });
     },
-    [setWatchedEpisodes, currentUser, manuallyWatchedShows]
+    [setWatchedEpisodes, currentUser?.uid, scheduleAtomicVaultSync]
   );
 
   const toggleMovieWatched = useCallback(
@@ -197,8 +295,16 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
       setWatchedMovies((prev) => {
         const exists = prev.includes(movieId);
         const nextCompleted = !exists;
+        if (nextCompleted) {
+          delete removedMoviesRef.current[String(movieId)];
+        } else {
+          removedMoviesRef.current[String(movieId)] = Date.now();
+        }
+        const nextList = exists ? prev.filter((id) => id !== movieId) : [...prev, movieId];
+        watchedMoviesRef.current = nextList;
 
         if (currentUser?.uid) {
+          scheduleAtomicVaultSync(currentUser.uid, { watchedMovies: nextList });
           saveWatchProgressFirestore(
             currentUser.uid,
             movieId,
@@ -208,10 +314,10 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
           ).catch((e) => console.error('Cloud movie progress save failed:', e));
         }
 
-        return exists ? prev.filter((id) => id !== movieId) : [...prev, movieId];
+        return nextList;
       });
     },
-    [setWatchedMovies, currentUser]
+    [setWatchedMovies, currentUser?.uid, scheduleAtomicVaultSync]
   );
 
   const toggleShowFullyWatched = useCallback(
@@ -219,9 +325,17 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
       setManuallyWatchedShows((prev) => {
         const exists = prev.includes(showId);
         const nextCompleted = !exists;
+        if (nextCompleted) {
+          delete removedShowsRef.current[String(showId)];
+        } else {
+          removedShowsRef.current[String(showId)] = Date.now();
+        }
+        const nextList = exists ? prev.filter((id) => id !== showId) : [...prev, showId];
+        manuallyWatchedShowsRef.current = nextList;
 
         if (currentUser?.uid) {
-          const eps = watchedEpisodes[showId] || [];
+          const eps = watchedEpisodesRef.current[showId] || [];
+          scheduleAtomicVaultSync(currentUser.uid, { manuallyWatchedShows: nextList });
           saveWatchProgressFirestore(
             currentUser.uid,
             showId,
@@ -231,10 +345,10 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
           ).catch((e) => console.error('Cloud show progress save failed:', e));
         }
 
-        return exists ? prev.filter((id) => id !== showId) : [...prev, showId];
+        return nextList;
       });
     },
-    [setManuallyWatchedShows, currentUser, watchedEpisodes]
+    [setManuallyWatchedShows, currentUser?.uid, scheduleAtomicVaultSync]
   );
 
   const watchedCompositeKeys = useMemo(() => {
@@ -253,30 +367,32 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
     const payload = {
       version: 2,
       exportedAt: new Date().toISOString(),
-      watchlist,
-      watchedMovies,
-      watchedEpisodes,
-      manuallyWatchedShows,
+      watchlist: watchlistRef.current,
+      watchedMovies: watchedMoviesRef.current,
+      watchedEpisodes: watchedEpisodesRef.current,
+      manuallyWatchedShows: manuallyWatchedShowsRef.current,
     };
     return JSON.stringify(payload, null, 2);
-  }, [watchlist, watchedMovies, watchedEpisodes, manuallyWatchedShows]);
+  }, []);
 
   const importLibraryJson = useCallback(
     (rawJson: string): boolean => {
       try {
         const parsed = JSON.parse(rawJson);
         if (!parsed || typeof parsed !== 'object') return false;
-        const nextWatchlist = Array.isArray(parsed.watchlist) ? parsed.watchlist : watchlist;
+        const nextWatchlist = Array.isArray(parsed.watchlist)
+          ? parsed.watchlist
+          : watchlistRef.current;
         const nextMovies = Array.isArray(parsed.watchedMovies)
           ? parsed.watchedMovies
-          : watchedMovies;
+          : watchedMoviesRef.current;
         const nextEps =
           parsed.watchedEpisodes && typeof parsed.watchedEpisodes === 'object'
             ? parsed.watchedEpisodes
-            : watchedEpisodes;
+            : watchedEpisodesRef.current;
         const nextShows = Array.isArray(parsed.manuallyWatchedShows)
           ? parsed.manuallyWatchedShows
-          : manuallyWatchedShows;
+          : manuallyWatchedShowsRef.current;
 
         setWatchlist(nextWatchlist);
         setWatchedMovies(nextMovies);
@@ -298,42 +414,44 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
         return false;
       }
     },
-    [
-      watchlist,
-      watchedMovies,
-      watchedEpisodes,
-      manuallyWatchedShows,
-      setWatchlist,
-      setWatchedMovies,
-      setWatchedEpisodes,
-      setManuallyWatchedShows,
-      currentUser,
-    ]
+    [setWatchlist, setWatchedMovies, setWatchedEpisodes, setManuallyWatchedShows, currentUser?.uid]
   );
 
   const resetLibraryData = useCallback(() => {
-    const oldWatchlist = [...watchlist];
+    const oldWatchlist = [...watchlistRef.current];
+    const nowMs = Date.now();
+    oldWatchlist.forEach((item) => {
+      const mType: 'movie' | 'tv' = resolveMediaType(item) === 'tv' ? 'tv' : 'movie';
+      removedWatchlistKeysRef.current[toFirestoreMediaKey(item.id, mType)] = nowMs;
+    });
+
     setWatchlist([]);
     setWatchedMovies([]);
     setWatchedEpisodes({});
     setManuallyWatchedShows([]);
 
     if (currentUser?.uid) {
+      scheduleAtomicVaultSync(currentUser.uid, {
+        watchlist: [],
+        watchedMovies: [],
+        manuallyWatchedShows: [],
+        watchedEpisodes: {},
+      });
       oldWatchlist.forEach((item) => {
         const mType: 'movie' | 'tv' = resolveMediaType(item) === 'tv' ? 'tv' : 'movie';
         deleteWatchlistItemFirestore(currentUser.uid, item.id, mType).catch(() => {});
       });
     }
   }, [
-    watchlist,
     setWatchlist,
     setWatchedMovies,
     setWatchedEpisodes,
     setManuallyWatchedShows,
-    currentUser,
+    currentUser?.uid,
+    scheduleAtomicVaultSync,
   ]);
 
-  const value = useMemo<LibraryContextValue>(
+  const stateValue = useMemo<LibraryStateContextValue>(
     () => ({
       watchlist,
       watchedEpisodes,
@@ -341,6 +459,19 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
       manuallyWatchedShows,
       watchedCompositeKeys,
       isInWatchlist,
+    }),
+    [
+      watchlist,
+      watchedEpisodes,
+      watchedMovies,
+      manuallyWatchedShows,
+      watchedCompositeKeys,
+      isInWatchlist,
+    ]
+  );
+
+  const actionsValue = useMemo<LibraryActionsContextValue>(
+    () => ({
       toggleWatchlist,
       toggleEpisodeWatched,
       toggleMovieWatched,
@@ -350,12 +481,6 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
       resetLibraryData,
     }),
     [
-      watchlist,
-      watchedEpisodes,
-      watchedMovies,
-      manuallyWatchedShows,
-      watchedCompositeKeys,
-      isInWatchlist,
       toggleWatchlist,
       toggleEpisodeWatched,
       toggleMovieWatched,
@@ -366,11 +491,27 @@ export const LibraryProvider: React.FC<{ children: React.ReactNode }> = ({ child
     ]
   );
 
-  return <LibraryContext.Provider value={value}>{children}</LibraryContext.Provider>;
+  return (
+    <LibraryActionsContext.Provider value={actionsValue}>
+      <LibraryStateContext.Provider value={stateValue}>{children}</LibraryStateContext.Provider>
+    </LibraryActionsContext.Provider>
+  );
 };
 
-export function useLibrary(): LibraryContextValue {
-  const ctx = useContext(LibraryContext);
-  if (!ctx) throw new Error('useLibrary must be used within a LibraryProvider');
+export function useLibraryState(): LibraryStateContextValue {
+  const ctx = useContext(LibraryStateContext);
+  if (!ctx) throw new Error('useLibraryState must be used within a LibraryProvider');
   return ctx;
+}
+
+export function useLibraryActions(): LibraryActionsContextValue {
+  const ctx = useContext(LibraryActionsContext);
+  if (!ctx) throw new Error('useLibraryActions must be used within a LibraryProvider');
+  return ctx;
+}
+
+export function useLibrary(): LibraryContextValue {
+  const state = useLibraryState();
+  const actions = useLibraryActions();
+  return useMemo(() => ({ ...state, ...actions }), [state, actions]);
 }

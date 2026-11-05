@@ -271,14 +271,32 @@ img {
   transform: scale(1.04);
 }
 
-/* 60fps Smart TV & VIDAA OS Hardware Performance & Focus Rules */
-html[data-tv-mode="true"] .ios-snap-rail {
+/* Phase 6: 60fps Smart TV, Low-End Smartphone & Data-Saver GPU Optimization Rules */
+html[data-tv-mode="true"] .ios-snap-rail,
+html[data-perf-tier="low"] .ios-snap-rail {
   scroll-snap-type: none !important;
 }
 
-html[data-tv-mode="true"] main [class*="backdrop-blur"] {
+html[data-tv-mode="true"] [class*="backdrop-blur"],
+html[data-perf-tier="low"] [class*="backdrop-blur"] {
   -webkit-backdrop-filter: none !important;
   backdrop-filter: none !important;
+}
+
+html[data-tv-mode="true"] [class*="shadow-2xl"],
+html[data-perf-tier="low"] [class*="shadow-2xl"] {
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.55) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 html[data-tv-mode="true"] button:focus,
@@ -291,5 +309,3 @@ html[data-tv-nav-active="true"] [data-tv-focusable="true"]:focus-visible {
   outline-offset: 3px !important;
   z-index: 60;
 }
-
-
